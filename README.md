@@ -132,6 +132,22 @@ nosleep-mac/
 
 因个人需求开发，从 v1 到 v15 迭代了十几轮。希望对有同样需求的 Mac 用户有帮助！
 
+## ❓ 常见问题
+
+**Q: 提示"无法验证开发者"或"已损坏"？**
+> 这是 macOS Gatekeeper 安全机制，因为 App 使用 ad-hoc 签名。解决方法：
+> 1. 右键点击 App → 选择「打开」→ 点击「打开」确认
+> 2. 或在终端执行：`xattr -cr /Applications/合盖不休眠.app`
+
+**Q: 提示需要 Python 3？**
+> macOS 11.0+ 已自带 Python 3（`/usr/bin/python3`），无需额外安装。如果仍提示缺少 Python，请确认系统版本是否符合要求。
+
+**Q: Intel Mac 能用吗？**
+> ✅ v1.5+ 已编译为 Universal Binary，同时支持 Apple Silicon 和 Intel Mac。
+
+**Q: 为什么最低要求 macOS 11.0？**
+> Swift 6.2 编译器最低要求 macOS 11.0，这是编译器限制，不是代码问题。2020 年后购买的 Mac 基本都符合要求。
+
 ---
 
 <p align="center">
