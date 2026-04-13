@@ -59,10 +59,40 @@ class MenuBarController: NSObject, NSMenuDelegate {
         startRefreshTimer()
     }
 
+    // 加载备用图标（用于 macOS 10.13-10.15）
+    func loadFallbackIcon() -> NSImage? {
+        let bundle = Bundle.main
+        if let iconPath = bundle.path(forResource: "AppIcon", ofType: "icns"),
+           let iconImg = NSImage(contentsOfFile: iconPath) {
+            return iconImg
+        }
+        if let iconPath = bundle.path(forResource: "AppIcon", ofType: "jpg"),
+           let iconImg = NSImage(contentsOfFile: iconPath) {
+            return iconImg
+        }
+        return nil
+    }
+
     func setupMenu() {
-        // 图标
+        // 图标 - 兼容 macOS 10.13+
         if let button = statusItem.button {
-            let img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "合盖不休眠")
+            let img: NSImage?
+            if #available(macOS 11.0, *) {
+                // macOS 11.0+ 使用 SF Symbols
+                img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "合盖不休眠")
+            } else {
+                // macOS 10.13-10.15 使用应用图标
+                let bundle = Bundle.main
+                if let iconPath = bundle.path(forResource: "AppIcon", ofType: "icns"),
+                   let iconImg = NSImage(contentsOfFile: iconPath) {
+                    img = iconImg
+                } else if let iconPath = bundle.path(forResource: "AppIcon", ofType: "jpg"),
+                          let iconImg = NSImage(contentsOfFile: iconPath) {
+                    img = iconImg
+                } else {
+                    img = nil
+                }
+            }
             img?.size = NSSize(width: 18, height: 18)
             img?.isTemplate = true
             button.image = img
@@ -301,7 +331,13 @@ done
                 self.toggleMenuItem.title = "关闭合盖不休眠"
 
                 if let button = self.statusItem.button {
-                    button.image = NSImage(systemSymbolName: "moon.zzz.fill", accessibilityDescription: "已开启")
+                    let img: NSImage?
+                    if #available(macOS 11.0, *) {
+                        img = NSImage(systemSymbolName: "moon.zzz.fill", accessibilityDescription: "已开启")
+                    } else {
+                        img = self.loadFallbackIcon()
+                    }
+                    button.image = img
                     button.image?.size = NSSize(width: 18, height: 18)
                     if let img = button.image { img.isTemplate = true }
                     if hasTimer {
@@ -314,7 +350,13 @@ done
                 self.statusMenuItem.title = "❌ 已关闭 — 正常休眠"
                 self.toggleMenuItem.title = "开启合盖不休眠"
                 if let button = self.statusItem.button {
-                    button.image = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "已关闭")
+                    let img: NSImage?
+                    if #available(macOS 11.0, *) {
+                        img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "已关闭")
+                    } else {
+                        img = self.loadFallbackIcon()
+                    }
+                    button.image = img
                     button.image?.size = NSSize(width: 18, height: 18)
                     if let img = button.image { img.isTemplate = true }
                     button.toolTip = "合盖不休眠 — 已关闭"

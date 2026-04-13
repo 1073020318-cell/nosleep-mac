@@ -116,11 +116,13 @@ nosleep-mac/
 
 | 要求 | 说明 |
 |------|------|
-| 系统 | macOS 11.0+ |
+| 系统 | **macOS 11.0+** (Big Sur 或更新版本) |
 | 芯片 | Apple Silicon（M1/M2/M3/M4）✅ / Intel Mac ✅ |
 | 权限 | 首次运行需管理员密码 |
 
 > ✅ v1.5+ 已编译为 Universal Binary，同时支持 Apple Silicon 和 Intel Mac。
+
+> ⚠️ **不支持 macOS 10.15 (Catalina) 及更低版本**。这是因为 Swift 6.2 编译器最低要求 macOS 11.0。如果你的 Mac 是 2020 年之前购买的旧机型，可能无法运行此版本。
 
 ## 📜 开源协议
 
