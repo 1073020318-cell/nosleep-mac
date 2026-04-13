@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-blue" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20(Universal)-blue" alt="platform">
   <img src="https://img.shields.io/badge/version-v15-green" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
 </p>
@@ -116,11 +116,11 @@ nosleep-mac/
 
 | 要求 | 说明 |
 |------|------|
-| 系统 | macOS 10.13+ |
-| 芯片 | Apple Silicon（M1/M2/M3/M4） |
+| 系统 | macOS 11.0+ |
+| 芯片 | Apple Silicon（M1/M2/M3/M4）✅ / Intel Mac ✅ |
 | 权限 | 首次运行需管理员密码 |
 
-> ⚠️ Intel Mac 暂不支持（menulet 为 arm64 编译）。如需 Intel 版本，请用 `swiftc -target x86_64-apple-macos10.13` 重新编译。
+> ✅ v1.5+ 已编译为 Universal Binary，同时支持 Apple Silicon 和 Intel Mac。
 
 ## 📜 开源协议
 
