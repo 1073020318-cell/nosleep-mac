@@ -1,0 +1,116 @@
+#!/bin/bash
+# ============================================================
+#  合盖不休眠 v14 — 快速响应 + 菜单栏版
+#
+#  v14 改进：
+#    - 菜单栏图标常驻（NSStatusItem），不占 Dock 位置
+#    - 一键开/关、状态显示、退出（退出时自动清理）
+#    - 开盖响应延迟优化：轮询 0.5s，开盖1次确认
+#    - 使用 DisplayServices 私有框架控制背光
+#
+#  启动流程：
+#    launch → 首次免密配置 → 启动 menulet（菜单栏常驻）
+#    menulet 负责所有功能：开/关/lidwatch/退出清理
+# ============================================================
+
+LOG_FILE="/tmp/nosleep_debug.log"
+SUDOERS_FILE="/etc/sudoers.d/nosleep"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MENULET="$SCRIPT_DIR/menulet"
+BACKLIGHTCTL="$SCRIPT_DIR/backlightctl"
+
+# ---- 日志函数 ----
+log() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+log "=== APP 启动 ==="
+
+# ---- 检查 menulet ----
+if [ ! -x "$MENULET" ]; then
+    log "⚠️ menulet 不存在: $MENULET"
+    /usr/bin/osascript -e 'display dialog "缺少 menulet 组件，请联系开发者" buttons {"好的"} with title "合盖不休眠" with icon stop'
+    exit 1
+fi
+
+# ---- 检查 backlightctl ----
+if [ ! -x "$BACKLIGHTCTL" ]; then
+    log "⚠️ backlightctl 不存在: $BACKLIGHTCTL"
+    /usr/bin/osascript -e 'display dialog "缺少 backlightctl 工具，请联系开发者" buttons {"好的"} with title "合盖不休眠" with icon stop'
+    exit 1
+fi
+
+# ---- 免密检查 ----
+has_nopasswd() {
+    /usr/bin/sudo -n /usr/bin/pmset -g > /dev/null 2>&1
+}
+
+# ---- 首次配置免密 ----
+setup_nopasswd() {
+    /usr/bin/osascript <<'EOF'
+set pw to text returned of (display dialog ¬
+    "首次使用「合盖不休眠」\n\n需要配置一次管理员授权。\n配置完成后，以后切换开关不再需要输入密码。\n\n请输入电脑登录密码：" ¬
+    default answer "" ¬
+    with title "首次设置" ¬
+    with hidden answer ¬
+    buttons {"取消", "确定"} ¬
+    default button "确定")
+
+if pw is not "" then
+    do shell script "echo " & quoted form of pw & " | sudo -S bash -c 'echo \"ALL ALL=NOPASSWD: /usr/bin/pmset\" > /etc/sudoers.d/nosleep && chmod 444 /etc/sudoers.d/nosleep' 2>&1"
+    
+    set check to do shell script "sudo -n pmset -g > /dev/null 2>&1 && echo OK || echo FAIL"
+    if check is "OK" then
+        display notification "免密配置成功 ✓" with title "合盖不休眠"
+        return "ok"
+    else
+        display dialog "配置失败，请重试" buttons {"好的"}
+        return "fail"
+    end if
+else
+    return "cancel"
+end if
+EOF
+}
+
+# ---- 检查 lidwatch 孤儿状态 ----
+fix_orphan_state() {
+    if [ -f "/tmp/no-sleep-lidwatch.pid" ]; then
+        local pid
+        pid=$(cat "/tmp/no-sleep-lidwatch.pid")
+        if ! kill -0 "$pid" 2>/dev/null; then
+            local disabled=$(/usr/bin/pmset -g 2>/dev/null | grep 'SleepDisabled' | awk '{print $2}')
+            if [ "$disabled" = "1" ]; then
+                log "⚠️ 孤儿状态：功能开启但 lidwatch 已死，menulet 会处理"
+            fi
+        fi
+    fi
+}
+
+# ---- 配置免密 ----
+log "检查免密状态..."
+
+if ! has_nopasswd; then
+    log "未配置免密，弹出设置窗口"
+    SETUP_RESULT=$(setup_nopasswd)
+    if ! has_nopasswd; then
+        log "免密配置失败，退出"
+        exit 1
+    fi
+fi
+
+# 修复孤儿状态
+fix_orphan_state
+
+# ---- 启动 menulet（菜单栏常驻进程）----
+# 检查是否已经在运行
+if pgrep -f "合盖不休眠.app/Contents/MacOS/menulet" > /dev/null 2>&1; then
+    log "menulet 已在运行，不重复启动"
+    /usr/bin/osascript -e 'display notification "已在菜单栏运行中" with title "合盖不休眠"'
+    exit 0
+fi
+
+log "启动 menulet（菜单栏常驻进程）"
+"$MENULET" &
+log "menulet 已启动，PID: $!"
+log "=== launch 退出（menulet 后台运行中）==="

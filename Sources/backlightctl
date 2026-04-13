@@ -1,0 +1,160 @@
+#!/usr/bin/python3
+"""
+backlightctl v2 - Apple Silicon 显示器背光控制工具
+
+v2 改进：
+  使用 DisplayServices 私有框架的 DisplayServicesSetBrightness/GetBrightness
+  这是 Apple Silicon 上控制亮度的正确 API（IOKit brightness 参数无效）
+
+用法:
+  backlightctl off    - 关闭显示器背光（亮度设为0）
+  backlightctl on     - 恢复显示器背光（恢复到关闭前的亮度）
+  backlightctl set N  - 设置亮度值 (0.0-1.0)
+  backlightctl get    - 获取当前亮度值 (0.0-1.0)
+
+原理:
+  通过 DisplayServices 私有框架的 DisplayServicesSetBrightness 控制亮度。
+  这是 Apple Silicon MacBook 上唯一可靠的亮度控制方式。
+  IOKit 的 AppleARMBacklight brightness 参数在 Apple Silicon 上不能控制实际背光。
+"""
+
+import sys
+import ctypes
+
+# DisplayServices 框架路径
+DS_FRAMEWORK = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
+
+# 亮度缓存文件
+BRIGHTNESS_CACHE = "/tmp/nosleep_brightness_cache"
+
+# 主显示器 ID
+MAIN_DISPLAY_ID = 1
+
+
+def get_ds():
+    """加载 DisplayServices 框架"""
+    try:
+        ds = ctypes.cdll.LoadLibrary(DS_FRAMEWORK)
+        ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+        ds.DisplayServicesGetBrightness.restype = ctypes.c_int32
+        ds.DisplayServicesSetBrightness.argtypes = [ctypes.c_uint32, ctypes.c_float]
+        ds.DisplayServicesSetBrightness.restype = ctypes.c_int32
+        return ds
+    except Exception as e:
+        print(f"错误: 无法加载 DisplayServices 框架: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_brightness(ds):
+    """获取当前亮度 (0.0-1.0)"""
+    val = ctypes.c_float(0)
+    result = ds.DisplayServicesGetBrightness(MAIN_DISPLAY_ID, ctypes.byref(val))
+    if result != 0:
+        return None
+    return val.value
+
+
+def set_brightness(ds, value):
+    """设置亮度 (0.0-1.0)"""
+    value = max(0.0, min(1.0, float(value)))
+    result = ds.DisplayServicesSetBrightness(MAIN_DISPLAY_ID, ctypes.c_float(value))
+    return result == 0
+
+
+def save_brightness(value):
+    """保存亮度值到缓存文件"""
+    with open(BRIGHTNESS_CACHE, 'w') as f:
+        f.write(str(value))
+
+
+def load_brightness():
+    """从缓存文件加载亮度值"""
+    try:
+        with open(BRIGHTNESS_CACHE, 'r') as f:
+            return float(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0.5  # 默认 50%
+
+
+def cmd_off(ds):
+    """关闭背光"""
+    current = get_brightness(ds)
+    if current is not None and current > 0:
+        save_brightness(current)
+        print(f"已保存当前亮度: {current:.4f}")
+    
+    if set_brightness(ds, 0.0):
+        print("背光已关闭 ✓")
+    else:
+        print("错误: 设置亮度失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_on(ds):
+    """恢复背光"""
+    saved = load_brightness()
+    
+    if set_brightness(ds, saved):
+        print(f"背光已恢复 ✓ (亮度: {saved:.4f})")
+    else:
+        print("错误: 恢复亮度失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_set(ds, value):
+    """设置亮度"""
+    try:
+        value = float(value)
+    except ValueError:
+        print("错误: 亮度值必须是 0.0-1.0 之间的数字", file=sys.stderr)
+        sys.exit(1)
+    
+    if not 0.0 <= value <= 1.0:
+        print("错误: 亮度值范围 0.0-1.0", file=sys.stderr)
+        sys.exit(1)
+    
+    if set_brightness(ds, value):
+        print(f"亮度已设置 ✓ ({value:.4f})")
+    else:
+        print("错误: 设置亮度失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_get(ds):
+    """获取当前亮度"""
+    current = get_brightness(ds)
+    if current is not None:
+        print(f"当前亮度: {current:.4f}")
+    else:
+        print("错误: 无法读取亮度", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    ds = get_ds()
+    
+    if len(sys.argv) < 2:
+        print(__doc__.strip())
+        sys.exit(1)
+    
+    cmd = sys.argv[1].lower()
+    
+    if cmd == 'off':
+        cmd_off(ds)
+    elif cmd == 'on':
+        cmd_on(ds)
+    elif cmd == 'set':
+        if len(sys.argv) < 3:
+            print("用法: backlightctl set <0.0-1.0>", file=sys.stderr)
+            sys.exit(1)
+        cmd_set(ds, sys.argv[2])
+    elif cmd == 'get':
+        cmd_get(ds)
+    else:
+        print(f"未知命令: {cmd}", file=sys.stderr)
+        print("可用命令: off, on, set, get")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
