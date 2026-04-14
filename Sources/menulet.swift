@@ -18,6 +18,7 @@
 // ============================================================
 
 import Cocoa
+import UserNotifications
 
 class MenuBarController: NSObject, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -34,9 +35,9 @@ class MenuBarController: NSObject, NSMenuDelegate {
 
     // 定时器
     var refreshTimer: Timer?          // 5秒周期状态刷新
-    var tickTimer: Timer?             // 1秒周期倒计时刷新
     var autoOffDeadline: Date?
     var autoOffTimer: Timer?          // 每秒检查定时触发
+    var lastTickSecond: Int = 0       // 上次刷新的整秒数，避免重复刷新或跳秒
 
     // 缓存状态
     var lastKnownState: Bool = false
@@ -61,7 +62,7 @@ class MenuBarController: NSObject, NSMenuDelegate {
         setupMenu()
         refreshStatus()
         startRefreshTimer()
-        startTickTimer()
+        startPreciseTick()
     }
 
     func loadFallbackIcon() -> NSImage? {
@@ -357,16 +358,12 @@ done
                 button.toolTip = "合盖不休眠 — 已开启 ⏱ \(formatRemaining(remaining))"
             }
             if on {
-                var detail = "合盖自动关屏"
-                if !isLidwatchAlive() { detail = "⚠️ 监听进程已停止" }
-                statusMenuItem.title = "✅ 已开启 — \(detail) | ⏱ \(formatRemaining(remaining))"
+                statusMenuItem.title = "✅ 已开启 — 合盖自动关屏 | ⏱ \(formatRemaining(remaining))"
             }
         } else {
             timerMenuItem.title = "定时关闭"
             if on {
-                var detail = "合盖自动关屏"
-                if !isLidwatchAlive() { detail = "⚠️ 监听进程已停止" }
-                statusMenuItem.title = "✅ 已开启 — \(detail)"
+                statusMenuItem.title = "✅ 已开启 — 合盖自动关屏"
                 if let button = statusItem.button {
                     button.toolTip = "合盖不休眠 — 已开启"
                 }
@@ -383,7 +380,6 @@ done
 
         if on {
             var detail = "合盖自动关屏"
-            if !lidwatchAlive { detail = "⚠️ 监听进程已停止" }
             if hasTimer {
                 detail += " | ⏱ \(formatRemaining(remaining))"
             }
@@ -443,10 +439,24 @@ done
         }
     }
 
-    // ★ 每秒刷新倒计时显示（不执行 shell，纯本地计算）
-    func startTickTimer() {
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateTimerDisplay()
+    // ★ 精确每秒刷新倒计时（使用 0.25s 轮询 + 整秒检测，确保不跳秒不漏秒）
+    func startPreciseTick() {
+        // 每 0.25 秒检查一次，只在整秒变化时才更新 UI
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard let deadline = self.autoOffDeadline, deadline.timeIntervalSinceNow > 0 else {
+                // 没有定时器或已过期，只需检查是否有残留更新
+                if self.lastTickSecond != 0 {
+                    self.lastTickSecond = 0
+                    self.updateTimerDisplay()
+                }
+                return
+            }
+            let currentSecond = Int(deadline.timeIntervalSinceNow)
+            if currentSecond != self.lastTickSecond {
+                self.lastTickSecond = currentSecond
+                self.updateTimerDisplay()
+            }
         }
     }
 
@@ -566,23 +576,19 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
     }
 
     func notify(_ title: String, _ body: String) {
-        // ★ 使用 UNUserNotificationCenter 发送通知（更可靠，开启/关闭都能弹窗）
+        // ★ 双通道通知：osascript + UNUserNotificationCenter，确保弹窗必现
+        // 通道1：osascript（最可靠，立刻显示）
+        let escTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        let escBody = body.replacingOccurrences(of: "\"", with: "\\\"")
+        shellAsync(["/usr/bin/osascript", "-e", "display notification \"\(escBody)\" with title \"\(escTitle)\""]) { _ in }
+
+        // 通道2：UNUserNotificationCenter（系统标准方式，作为补充）
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = nil
-
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { error in
-            if error != nil {
-                // 降级到 osascript
-                let escTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
-                let escBody = body.replacingOccurrences(of: "\"", with: "\\\"")
-                DispatchQueue.main.async {
-                    self.shell("/usr/bin/osascript", "-e", "display notification \"\(escBody)\" with title \"\(escTitle)\"")
-                }
-            }
-        }
+        UNUserNotificationCenter.current().add(request) { _ in }
     }
 }
 
@@ -616,9 +622,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 }
-
-// 需要导入 UserNotifications
-import UserNotifications
 
 // 启动
 let app = NSApplication.shared
