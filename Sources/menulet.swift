@@ -144,8 +144,11 @@ class MenuBarController: NSObject, NSMenuDelegate {
     // ============================================================
 
     func isFeatureOn() -> Bool {
-        let result = shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-g", "custom")
-        return result.contains("disablesleep    1")
+        // 注意：此方法同步执行 shell，会阻塞调用线程
+        // 仅用于 toggleFeature / quitApp 等用户主动触发的操作
+        // refreshStatus 已改用异步方式
+        let result = shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-g")
+        return checkFeatureOn(from: result)
     }
 
     func isLidwatchAlive() -> Bool {
@@ -308,13 +311,12 @@ done
     // ============================================================
 
     func refreshStatus() {
-        let on = isFeatureOn()
-        let alive = isLidwatchAlive()
-
-        // ★ 关键修复：在主队列内部计算 remaining，
-        //   避免多定时器异步调度时的竞态条件导致倒计时跳变
-        DispatchQueue.main.async { [weak self] in
+        // ★ 关键修复：状态检测在后台线程执行，避免主线程阻塞导致 UI 卡死/灰色
+        shellAsync(["/usr/bin/sudo", "-n", "/usr/bin/pmset", "-g"]) { [weak self] result in
             guard let self = self else { return }
+
+            let on = self.checkFeatureOn(from: result)
+            let alive = self.isLidwatchAlive()
 
             // 在主队列中实时计算剩余时间，确保每次渲染都是最新值
             let remaining = self.autoOffDeadline?.timeIntervalSinceNow ?? 0
@@ -329,6 +331,7 @@ done
                 }
                 self.statusMenuItem.title = "✅ 已开启 — \(detail)"
                 self.toggleMenuItem.title = "关闭合盖不休眠"
+                self.toggleMenuItem.isEnabled = true
 
                 if let button = self.statusItem.button {
                     let img: NSImage?
@@ -349,6 +352,8 @@ done
             } else {
                 self.statusMenuItem.title = "❌ 已关闭 — 正常休眠"
                 self.toggleMenuItem.title = "开启合盖不休眠"
+                self.toggleMenuItem.isEnabled = true
+
                 if let button = self.statusItem.button {
                     let img: NSImage?
                     if #available(macOS 11.0, *) {
@@ -374,6 +379,16 @@ done
                 self.timerMenuItem.title = "定时关闭"
             }
         }
+    }
+
+    // 从 pmset -g 输出中解析 SleepDisabled 状态
+    func checkFeatureOn(from pmsetOutput: String) -> Bool {
+        if let range = pmsetOutput.range(of: "SleepDisabled") {
+            let after = pmsetOutput[range.upperBound...]
+            let trimmed = after.trimmingCharacters(in: CharacterSet(charactersIn: "\t"))
+            return trimmed.hasPrefix("1")
+        }
+        return false
     }
 
     func startRefreshTimer() {
@@ -447,9 +462,10 @@ done
     // ============================================================
 
     @discardableResult
-    func shell(_ args: String...) -> String {
+    func shell(_ args: [String]) -> String {
+        guard let executable = args.first else { return "" }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: args[0])
+        process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = Array(args.dropFirst())
 
         let pipe = Pipe()
@@ -463,6 +479,22 @@ done
             return String(data: data, encoding: .utf8) ?? ""
         } catch {
             return ""
+        }
+    }
+
+    @discardableResult
+    func shell(_ args: String...) -> String {
+        return shell(args)
+    }
+
+    // ★ 非阻塞版 shell：在后台线程执行，完成后在主线程回调
+    func shellAsync(_ args: [String], completion: @escaping (String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let result = self.shell(args)
+            DispatchQueue.main.async {
+                completion(result)
+            }
         }
     }
 
