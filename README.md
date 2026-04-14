@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%20(Universal)-blue" alt="platform">
-  <img src="https://img.shields.io/badge/version-v15.2-green" alt="version">
+  <img src="https://img.shields.io/badge/version-v1.5.0-green" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
 </p>
 

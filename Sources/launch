@@ -85,12 +85,37 @@ log "✅ backlightctl 就绪"
 
 # ---- 4. 检查 Python3 ----
 log "检查 Python3..."
-if [ ! -x "/usr/bin/python3" ]; then
-    log "❌ /usr/bin/python3 不存在"
-    show_error "缺少 Python 3！\n\nmacOS 11.0+ 应自带 Python 3。\n如果没有，请在终端执行：\nxcode-select --install"
+find_python3() {
+    for p in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+        if [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    which python3 2>/dev/null
+}
+PYTHON3_PATH=$(find_python3)
+if [ -z "$PYTHON3_PATH" ]; then
+    log "❌ 未找到 python3"
+    show_error "缺少 Python 3！\n\n请在终端执行以下命令安装：\nxcode-select --install\n\n或从 python.org 下载安装 Python3"
     exit 1
 fi
-log "✅ Python3 就绪"
+log "✅ Python3 就绪: $PYTHON3_PATH"
+
+# ★ 修复 backlightctl 的 shebang：使用找到的 python3 路径
+if [ -f "$BACKLIGHTCTL" ]; then
+    CURRENT_SHEBANG=$(head -1 "$BACKLIGHTCTL")
+    CORRECT_SHEBANG="#!$PYTHON3_PATH"
+    if [ "$CURRENT_SHEBANG" != "$CORRECT_SHEBANG" ]; then
+        TMPFILE=$(mktemp)
+        echo "$CORRECT_SHEBANG" > "$TMPFILE"
+        tail -n +2 "$BACKLIGHTCTL" >> "$TMPFILE"
+        cat "$TMPFILE" > "$BACKLIGHTCTL"
+        rm -f "$TMPFILE"
+        chmod +x "$BACKLIGHTCTL"
+        log "已修复 backlightctl shebang: $CORRECT_SHEBANG"
+    fi
+fi
 
 # ---- 5. 免密检查 ----
 has_nopasswd() {

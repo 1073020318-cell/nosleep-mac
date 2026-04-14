@@ -11,6 +11,11 @@ build/
 # 编译产物
 *.o
 *.out
+menulet_arm64
+menulet_x86_64
+menulet_backup
+Sources/menulet_arm64
+Sources/menulet_x86_64
 
 # 临时文件
 *.log

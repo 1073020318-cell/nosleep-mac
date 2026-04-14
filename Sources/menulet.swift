@@ -180,56 +180,172 @@ class MenuBarController: NSObject, NSMenuDelegate {
     func enableFeatureAsync() {
         statusMenuItem.title = "⏳ 正在开启…"
         toggleMenuItem.isEnabled = false
+        logDebug("开始开启功能")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-
-            // 1. 设置 pmset
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", "1")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "sleep", "0")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "displaysleep", "0")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disksleep", "0")
-
-            // 2. 写 lidwatch 脚本
-            // ★ 关键修复：ioreg 必须用 -l -p IOService 才能读到 AppleClamshellState
-            let script = """
+            
+            let startTime = Date()
+            
+            // 使用 DispatchGroup 并行执行 pmset 和脚本准备
+            let group = DispatchGroup()
+            
+            // 1. 异步执行 pmset 命令（合并命令）
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.logDebug("开始执行 pmset 命令")
+                let result = self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", "1", "sleep", "0", "displaysleep", "0", "disksleep", "0")
+                self.logDebug("pmset 命令完成: \(result.isEmpty ? "空输出" : result.prefix(50))...")
+                group.leave()
+            }
+            
+            // 2. 写 lidwatch 脚本（并行执行）
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.logDebug("开始创建 lidwatch 脚本")
+                // ★ 关键修复：ioreg 必须用 -l -p IOService 才能读到 AppleClamshellState
+                let script = """
 #!/bin/bash
-# lidwatch — 监听合盖/开盖，控制背光
+# lidwatch v4 — 监听合盖/开盖，控制背光（防闪屏 + 兼容版）
+# 修复：进程互斥 + 状态确认 + 去抖 + Python3 兼容
+
 LOG="/tmp/nosleep_debug.log"
 BACKLIGHTCTL="\(self.backlightctl)"
+PIDFILE="/tmp/nosleep_lidwatch.pid"
+
+# ★ 进程互斥：确保只有一个 lidwatch 实例运行
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date '+%H:%M:%S')] lidwatch 已在运行 (PID=$OLD_PID)，退出" >> "$LOG"
+        exit 0
+    fi
+fi
+
+# 写入当前 PID
+echo $$ > "$PIDFILE"
+
+# 清理函数：退出时删除 PID 文件
+cleanup() {
+    rm -f "$PIDFILE"
+    exit 0
+}
+trap cleanup SIGTERM SIGINT SIGHUP
+
 LAST_STATE=""
+CANDIDATE_STATE=""
+CONFIRM_COUNT=0
+REQUIRED_CONFIRMS=2  # 连续确认次数（防止传感器抖动）
+DEBOUNCE_SEC=1       # ★ 去抖时间（秒），两次触发至少间隔1秒
+LAST_TRIGGER_TIME=0
+BRIGHTNESS_FILE="/tmp/nosleep_brightness"  # 记录背光状态，防止重复触发
 
 while true; do
-    # ★ 修复：用 ioreg -l -p IOService 才能正确读取合盖状态
-    STATE=$(ioreg -l -p IOService | grep '"AppleClamshellState"' | head -1 | sed 's/.*= //' | tr -d '[:space:]')
+    # 优化：使用 -r -k 快速查询 AppleClamshellState
+    STATE=$(ioreg -r -k AppleClamshellState -p IOService 2>/dev/null | grep '"AppleClamshellState"' | head -1 | sed 's/.*= //' | tr -d '[:space:]')
 
-    if [ "$STATE" = "Yes" ] && [ "$LAST_STATE" != "Yes" ]; then
-        echo "[$(date '+%H:%M:%S')] 合盖 → 关背光" >> "$LOG"
-        "$BACKLIGHTCTL" off 2>> "$LOG"
-        LAST_STATE="Yes"
-    elif [ "$STATE" = "No" ] && [ "$LAST_STATE" != "No" ]; then
-        echo "[$(date '+%H:%M:%S')] 开盖 → 恢复背光" >> "$LOG"
-        "$BACKLIGHTCTL" on 2>> "$LOG"
-        /usr/bin/caffeinate -u -t 1 2>/dev/null
-        LAST_STATE="No"
+    # 状态确认机制：连续多次检测到相同状态才触发
+    if [ "$STATE" = "$CANDIDATE_STATE" ]; then
+        CONFIRM_COUNT=$((CONFIRM_COUNT + 1))
+    else
+        CANDIDATE_STATE="$STATE"
+        CONFIRM_COUNT=1
     fi
 
-    sleep 0.5
+    if [ "$CONFIRM_COUNT" -ge "$REQUIRED_CONFIRMS" ] && [ "$STATE" != "$LAST_STATE" ]; then
+        # ★ 去抖：两次触发间隔至少 DEBOUNCE_SEC 秒
+        NOW_SEC=$(date +%s)
+        ELAPSED=$((NOW_SEC - LAST_TRIGGER_TIME))
+        if [ "$ELAPSED" -lt "$DEBOUNCE_SEC" ]; then
+            # 去抖中，跳过此次触发
+            :
+        elif [ "$STATE" = "Yes" ]; then
+            # 合盖 → 关背光（仅在背光为 on 时执行）
+            if [ ! -f "$BRIGHTNESS_FILE" ] || [ "$(cat "$BRIGHTNESS_FILE" 2>/dev/null)" != "off" ]; then
+                echo "[$(date '+%H:%M:%S')] 合盖 → 关背光" >> "$LOG"
+                "$BACKLIGHTCTL" off >/dev/null 2>&1 || true
+                echo "off" > "$BRIGHTNESS_FILE"
+                LAST_STATE="Yes"
+                LAST_TRIGGER_TIME=$NOW_SEC
+            fi
+        elif [ "$STATE" = "No" ]; then
+            # 开盖 → 恢复背光（仅在背光为 off 时执行）
+            if [ "$(cat "$BRIGHTNESS_FILE" 2>/dev/null)" = "off" ]; then
+                echo "[$(date '+%H:%M:%S')] 开盖 → 恢复背光" >> "$LOG"
+                "$BACKLIGHTCTL" on >/dev/null 2>&1 || true
+                /usr/bin/caffeinate -u -t 1 >/dev/null 2>&1 || true
+                echo "on" > "$BRIGHTNESS_FILE"
+                LAST_STATE="No"
+                LAST_TRIGGER_TIME=$NOW_SEC
+            fi
+        fi
+    fi
+
+    sleep 0.1
 done
 """
-            try? script.write(toFile: self.lidwatchScript, atomically: true, encoding: .utf8)
-            self.shell("/bin/chmod", "+x", self.lidwatchScript)
-
-            // 3. 启动 lidwatch（后台执行，获取 PID）
-            let pid = self.shell("/bin/bash", "-c", "\(self.lidwatchScript) & echo $!")
-            let cleanPid = pid.trimmingCharacters(in: .whitespacesAndNewlines)
-            try? cleanPid.write(toFile: self.lidwatchPidFile, atomically: true, encoding: .utf8)
-
-            // 4. 回主线程更新 UI + 通知
+                do {
+                    try script.write(toFile: self.lidwatchScript, atomically: true, encoding: .utf8)
+                    self.logDebug("脚本写入完成: \(self.lidwatchScript)")
+                    self.shell("/bin/chmod", "+x", self.lidwatchScript)
+                    self.logDebug("脚本添加执行权限")
+                } catch {
+                    self.logDebug("脚本写入失败: \(error)")
+                }
+                group.leave()
+            }
+            
+            // 等待并行任务完成
+            group.wait()
+            
+            let elapsed = Date().timeIntervalSince(startTime)
+            self.logDebug("开启功能总耗时: \(String(format: "%.2f", elapsed))秒")
+            
+            // 3. 回主线程立即更新 UI（不等待 lidwatch 启动）
             DispatchQueue.main.async {
                 self.lastKnownState = true
+                // 先假设 lidwatch 会启动成功
+                self.updateUI(on: true, lidwatchAlive: true)
+                self.logDebug("UI 已更新为开启状态")
+                // 发送通知
                 self.notify("合盖不休眠已开启", "合盖后电脑将继续运行，屏幕自动关闭省电")
+                // 异步刷新状态以确认
                 self.refreshStatus()
+            }
+            
+            // 4. 在后台异步启动 lidwatch（不阻塞 UI 响应）
+            // ★ 修复闪屏：先杀所有残留，再用 Process 直接启动并 detach，避免 bash -c "&" PID 不可靠
+            DispatchQueue.global(qos: .background).async {
+                self.logDebug("开始启动 lidwatch")
+                // 先清理所有残留的 lidwatch 进程
+                self.shell("/usr/bin/pkill", "-f", "nosleep_lidwatch")
+                self.logDebug("已清理残留 lidwatch 进程")
+                // 短暂等待确保清理完成
+                Thread.sleep(forTimeInterval: 0.3)
+                
+                // 使用 Process 直接启动脚本，不 waitUntilExit（detach 模式）
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/bash")
+                process.arguments = [self.lidwatchScript]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                    // ★ 保存 Process 引用，防止 ARC 释放导致子进程被杀
+                    self.lidwatchProcess = process
+                    self.logDebug("lidwatch 已启动 (PID=\(process.processIdentifier))")
+                } catch {
+                    self.logDebug("⚠️ lidwatch 启动失败: \(error)")
+                }
+                
+                // 等待脚本自身写入 PID 文件
+                Thread.sleep(forTimeInterval: 0.5)
+                if FileManager.default.fileExists(atPath: "/tmp/nosleep_lidwatch.pid") {
+                    let pid = (try? String(contentsOfFile: "/tmp/nosleep_lidwatch.pid", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+                    self.logDebug("lidwatch 运行中 (PID=\(pid))")
+                } else {
+                    self.logDebug("⚠️ lidwatch PID 文件未生成，可能启动失败")
+                }
             }
         }
     }
@@ -241,11 +357,8 @@ done
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // 1. 恢复 pmset
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", "0")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "sleep", "1")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "displaysleep", "10")
-            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disksleep", "10")
+            // 1. 合并 pmset 命令
+            self.shell("/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", "0", "sleep", "1", "displaysleep", "10", "disksleep", "10")
 
             // 2. 停止 lidwatch
             self.stopLidwatch()
@@ -255,22 +368,39 @@ done
                 self.cancelAutoOff()
             }
 
-            // 4. 回主线程更新 UI + 通知
+            // 4. 回主线程立即更新 UI
             DispatchQueue.main.async {
                 self.lastKnownState = false
+                self.updateUI(on: false, lidwatchAlive: false)
                 self.notify("合盖不休眠已关闭", "电脑恢复正常休眠")
+                // 异步刷新状态以确认
                 self.refreshStatus()
             }
         }
     }
 
+    // ★ 保持 Process 引用，防止被 ARC 释放导致子进程被杀
+    private var lidwatchProcess: Process?
+    
     func stopLidwatch() {
+        // ★ 修复：杀掉所有 lidwatch 进程（防止进程泄漏导致闪屏）
+        // 1. 释放 Process 对象引用
+        if let proc = lidwatchProcess, proc.isRunning {
+            proc.terminate()
+            lidwatchProcess = nil
+        }
+        // 2. 先尝试杀 PID 文件中记录的进程
         if FileManager.default.fileExists(atPath: lidwatchPidFile),
            let pidStr = try? String(contentsOfFile: lidwatchPidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            let pid = Int32(pidStr) {
             kill(pid, SIGTERM)
         }
+        // 3. 兜底：杀掉所有名为 nosleep_lidwatch 的进程（清理泄漏的旧进程）
+        shell("/usr/bin/pkill", "-f", "nosleep_lidwatch")
+        // 4. 清理所有临时文件
         try? FileManager.default.removeItem(atPath: lidwatchPidFile)
+        try? FileManager.default.removeItem(atPath: "/tmp/nosleep_lidwatch.lock")
+        try? FileManager.default.removeItem(atPath: "/tmp/nosleep_brightness")
     }
 
     // ============================================================
@@ -575,20 +705,52 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
         }
     }
 
-    func notify(_ title: String, _ body: String) {
-        // ★ 双通道通知：osascript + UNUserNotificationCenter，确保弹窗必现
-        // 通道1：osascript（最可靠，立刻显示）
-        let escTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
-        let escBody = body.replacingOccurrences(of: "\"", with: "\\\"")
-        shellAsync(["/usr/bin/osascript", "-e", "display notification \"\(escBody)\" with title \"\(escTitle)\""]) { _ in }
+    func logDebug(_ message: String) {
+        let logPath = "/tmp/nosleep_menulet.log"
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let line = "[\(timestamp)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if let handle = FileHandle(forWritingAtPath: logPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: logPath), options: .atomic)
+            }
+        }
+    }
 
-        // 通道2：UNUserNotificationCenter（系统标准方式，作为补充）
+    func notify(_ title: String, _ body: String) {
+        logDebug("通知发送开始: \(title) - \(body)")
+        
+        // ★ 简化通知逻辑：直接发送 UNNotification，失败时使用 NSUserNotification 备选
+        let center = UNUserNotificationCenter.current()
+        
+        // 直接发送 UNNotification
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = nil
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { _ in }
+        
+        center.add(request) { [weak self] error in
+            if let error = error {
+                self?.logDebug("UNNotification 发送失败: \(error.localizedDescription)")
+                // 失败时尝试 NSUserNotification（旧 API）
+                DispatchQueue.main.async {
+                    let note = NSUserNotification()
+                    note.title = title
+                    note.informativeText = body
+                    note.soundName = nil
+                    note.identifier = UUID().uuidString
+                    note.deliveryDate = Date()
+                    NSUserNotificationCenter.default.scheduleNotification(note)
+                    self?.logDebug("已发送 NSUserNotification 作为备选")
+                }
+            } else {
+                self?.logDebug("UNNotification 发送成功")
+            }
+        }
     }
 }
 
@@ -596,13 +758,16 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
 // MARK: - AppDelegate
 // ============================================================
 
-class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSUserNotificationCenterDelegate {
     var controller: MenuBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // ★ 请求通知权限，确保弹窗通知能显示
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        
+        // ★ 设置旧版通知中心代理，确保 NSUserNotification 能在前台显示
+        NSUserNotificationCenter.default.delegate = self
 
         controller = MenuBarController()
     }
@@ -610,6 +775,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     // ★ 确保即使 App 在前台也能显示通知
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound])
+    }
+    
+    // ★ NSUserNotificationCenterDelegate: 确保旧版通知在前台也能显示
+    func userNotificationCenter(_ center: NSUserNotificationCenter, shouldPresent notification: NSUserNotification) -> Bool {
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
