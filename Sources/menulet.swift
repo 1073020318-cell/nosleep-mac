@@ -596,11 +596,9 @@ done
 
     @objc func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "合盖不休眠 v15"
+        alert.messageText = "合盖不休眠 v1.5.0"
         alert.informativeText = """
 MacBook 合盖后保持运行，自动关闭屏幕省电。
-
-📦 开源地址：github.com/1073020318-cell/nosleep-mac
 
 —— 关注作者 ——
 🎵 抖音：ywhhxs1998
@@ -609,7 +607,15 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
 点赞关注，私信获取安装包～
 """
         alert.addButton(withTitle: "好的")
-        alert.runModal()
+        alert.addButton(withTitle: "🔗 打开下载页面")
+        let response = alert.runModal()
+        
+        // 点击第二个按钮时打开 GitHub Release 页面
+        if response == .alertSecondButtonReturn {
+            if let url = URL(string: "https://github.com/1073020318-cell/nosleep-mac/releases") {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     @objc func quitApp() {
