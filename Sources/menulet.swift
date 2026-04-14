@@ -14,7 +14,7 @@
 //    swiftc -o menulet menulet.swift -framework Cocoa
 //
 //  作者：龙皇
-//  开源协议：MIT License
+//  
 // ============================================================
 
 import Cocoa
@@ -393,7 +393,6 @@ done
         MacBook 合盖后保持运行，自动关闭屏幕省电。
 
         📦 开源地址：github.com/1073020318-cell/nosleep-mac
-        📄 协议：MIT License
 
         —— 关注作者 ——
         🎵 抖音：ywhhxs1998
