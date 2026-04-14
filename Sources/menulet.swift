@@ -596,7 +596,7 @@ done
 
     @objc func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "合盖不休眠 v1.5.0"
+        alert.messageText = "合盖不休眠 v1.6.0"
         alert.informativeText = """
 MacBook 合盖后保持运行，自动关闭屏幕省电。
 
