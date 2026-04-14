@@ -389,7 +389,18 @@ done
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "合盖不休眠 v15"
-        alert.informativeText = "MacBook 合盖后保持运行，自动关闭屏幕省电。\n\n开源地址：gitee.com\n协议：MIT License"
+        alert.informativeText = """
+        MacBook 合盖后保持运行，自动关闭屏幕省电。
+
+        📦 开源地址：github.com/1073020318-cell/nosleep-mac
+        📄 协议：MIT License
+
+        —— 关注作者 ——
+        🎵 抖音：ywhhxs1998
+        📕 小红书：4270972670
+
+        点赞关注，私信获取安装包～
+        """
         alert.addButton(withTitle: "好的")
         alert.runModal()
     }
