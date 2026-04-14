@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%20(Universal)-blue" alt="platform">
-  <img src="https://img.shields.io/badge/version-v15-green" alt="version">
+  <img src="https://img.shields.io/badge/version-v15.2-green" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
 </p>
 
@@ -48,7 +48,7 @@ MacBook 合上屏幕后会自动休眠，导致：
 
 ```bash
 # 克隆仓库
-git clone https://gitee.com/你的用户名/nosleep-mac.git
+git clone https://github.com/1073020318-cell/nosleep-mac.git
 cd nosleep-mac
 
 # 构建 App
@@ -132,7 +132,9 @@ nosleep-mac/
 
 因个人需求开发，从 v1 到 v15 迭代了十几轮。希望对有同样需求的 Mac 用户有帮助！
 
-## ❓ 常见问题
+## ❓ 常见问题与排错
+
+### 基础问题
 
 **Q: 提示"无法验证开发者"或"已损坏"？**
 > 这是 macOS Gatekeeper 安全机制，因为 App 使用 ad-hoc 签名。解决方法：
@@ -140,13 +142,49 @@ nosleep-mac/
 > 2. 或在终端执行：`xattr -cr /Applications/合盖不休眠.app`
 
 **Q: 提示需要 Python 3？**
-> macOS 11.0+ 已自带 Python 3（`/usr/bin/python3`），无需额外安装。如果仍提示缺少 Python，请确认系统版本是否符合要求。
+> macOS 11.0+ 已自带 Python 3（`/usr/bin/python3`），无需额外安装。如果仍提示缺少 Python，请确认系统版本是否符合要求，或在终端执行 `xcode-select --install`。
 
 **Q: Intel Mac 能用吗？**
 > ✅ v1.5+ 已编译为 Universal Binary，同时支持 Apple Silicon 和 Intel Mac。
 
 **Q: 为什么最低要求 macOS 11.0？**
 > Swift 6.2 编译器最低要求 macOS 11.0，这是编译器限制，不是代码问题。2020 年后购买的 Mac 基本都符合要求。
+
+### 排错指南
+
+**Q: 双击 App 没有任何反应？**
+
+> 请按以下步骤排查：
+>
+> **步骤1**：在终端执行 `xattr -cr /Applications/合盖不休眠.app`，然后右键→打开
+>
+> **步骤2**：如果仍然没反应，在终端手动启动查看报错：
+> ```bash
+> /Applications/合盖不休眠.app/Contents/MacOS/launch
+> ```
+> 把终端显示的错误信息截图反馈。
+>
+> **步骤3**：查看日志文件 `/tmp/nosleep_debug.log`
+
+**Q: 输入密码后还是没反应？**
+> 可能密码输入错误，或当前用户不是管理员。请在终端手动执行：
+> ```bash
+> sudo bash -c 'echo "ALL ALL=NOPASSWD: /usr/bin/pmset" > /etc/sudoers.d/nosleep'
+> sudo chmod 444 /etc/sudoers.d/nosleep
+> ```
+> 然后重新打开 App。
+
+**Q: 菜单栏图标不出现？**
+> menulet 可能启动后崩溃了。在终端手动启动查看具体错误：
+> ```bash
+> /Applications/合盖不休眠.app/Contents/MacOS/menulet
+> ```
+> 如果提示 `Library not loaded` 或 `libswiftCore` 相关错误，说明 Swift 运行时版本不兼容，请更新 macOS 到最新版本。
+
+**Q: 如何反馈问题？**
+> 1. 查看 `/tmp/nosleep_debug.log` 日志
+> 2. 在终端执行 `launch` 和 `menulet` 的输出截图
+> 3. 到 [GitHub Issues](../../issues) 提交问题
 
 ---
 

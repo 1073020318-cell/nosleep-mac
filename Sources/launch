@@ -1,16 +1,16 @@
 #!/bin/bash
 # ============================================================
-#  合盖不休眠 v14 — 快速响应 + 菜单栏版
+#  合盖不休眠 v15.2 — 快速响应 + 菜单栏版
 #
-#  v14 改进：
-#    - 菜单栏图标常驻（NSStatusItem），不占 Dock 位置
-#    - 一键开/关、状态显示、退出（退出时自动清理）
-#    - 开盖响应延迟优化：轮询 0.5s，开盖1次确认
-#    - 使用 DisplayServices 私有框架控制背光
+#  v15.2 改进：
+#    - 添加系统版本检查（最低 macOS 11.0）
+#    - 添加 Swift 运行时检查
+#    - menulet 启动失败时弹出错误提示
+#    - 启动后验证菜单栏图标是否出现
+#    - 详细的排错日志
 #
 #  启动流程：
-#    launch → 首次免密配置 → 启动 menulet（菜单栏常驻）
-#    menulet 负责所有功能：开/关/lidwatch/退出清理
+#    launch → 系统检查 → 首次免密配置 → 启动 menulet → 验证
 # ============================================================
 
 LOG_FILE="/tmp/nosleep_debug.log"
@@ -24,23 +24,75 @@ log() {
     echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
+# ---- 错误弹窗 ----
+show_error() {
+    /usr/bin/osascript -e "display dialog \"$1\" buttons {\"好的\"} with title \"合盖不休眠\" with icon stop" 2>/dev/null
+}
+
+# ---- 通知 ----
+show_notify() {
+    /usr/bin/osascript -e "display notification \"$1\" with title \"合盖不休眠\"" 2>/dev/null
+}
+
 log "=== APP 启动 ==="
 
-# ---- 检查 menulet ----
+# ---- 1. 系统版本检查 ----
+log "检查系统版本..."
+MACOS_VERSION=$(sw_vers -productVersion 2>/dev/null)
+log "macOS 版本: $MACOS_VERSION"
+
+# 提取主版本号 (如 11.0, 14.5)
+MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
+if [ -z "$MAJOR" ] || [ "$MAJOR" -lt 11 ] 2>/dev/null; then
+    log "❌ 系统版本过低: $MACOS_VERSION"
+    show_error "系统版本过低！\n\n当前: macOS $MACOS_VERSION\n需要: macOS 11.0 (Big Sur) 或更高版本\n\n请在「关于本机」中检查系统版本。"
+    exit 1
+fi
+log "✅ 系统版本符合要求"
+
+# ---- 2. 检查 menulet ----
+log "检查 menulet..."
+if [ ! -f "$MENULET" ]; then
+    log "❌ menulet 不存在: $MENULET"
+    show_error "缺少 menulet 组件！\n\nApp 可能已损坏，请重新下载安装。"
+    exit 1
+fi
+
 if [ ! -x "$MENULET" ]; then
-    log "⚠️ menulet 不存在: $MENULET"
-    /usr/bin/osascript -e 'display dialog "缺少 menulet 组件，请联系开发者" buttons {"好的"} with title "合盖不休眠" with icon stop'
+    log "⚠️ menulet 不可执行，尝试修复权限..."
+    chmod +x "$MENULET" 2>/dev/null
+    if [ ! -x "$MENULET" ]; then
+        log "❌ 无法修复 menulet 权限"
+        show_error "menulet 权限异常！\n\n请在终端执行：\nchmod +x \"$MENULET\""
+        exit 1
+    fi
+fi
+log "✅ menulet 就绪"
+
+# ---- 3. 检查 backlightctl ----
+log "检查 backlightctl..."
+if [ ! -f "$BACKLIGHTCTL" ]; then
+    log "❌ backlightctl 不存在: $BACKLIGHTCTL"
+    show_error "缺少 backlightctl 工具！\n\nApp 可能已损坏，请重新下载安装。"
     exit 1
 fi
 
-# ---- 检查 backlightctl ----
 if [ ! -x "$BACKLIGHTCTL" ]; then
-    log "⚠️ backlightctl 不存在: $BACKLIGHTCTL"
-    /usr/bin/osascript -e 'display dialog "缺少 backlightctl 工具，请联系开发者" buttons {"好的"} with title "合盖不休眠" with icon stop'
+    log "⚠️ backlightctl 不可执行，尝试修复权限..."
+    chmod +x "$BACKLIGHTCTL" 2>/dev/null
+fi
+log "✅ backlightctl 就绪"
+
+# ---- 4. 检查 Python3 ----
+log "检查 Python3..."
+if [ ! -x "/usr/bin/python3" ]; then
+    log "❌ /usr/bin/python3 不存在"
+    show_error "缺少 Python 3！\n\nmacOS 11.0+ 应自带 Python 3。\n如果没有，请在终端执行：\nxcode-select --install"
     exit 1
 fi
+log "✅ Python3 就绪"
 
-# ---- 免密检查 ----
+# ---- 5. 免密检查 ----
 has_nopasswd() {
     /usr/bin/sudo -n /usr/bin/pmset -g > /dev/null 2>&1
 }
@@ -58,7 +110,7 @@ set pw to text returned of (display dialog ¬
 
 if pw is not "" then
     do shell script "echo " & quoted form of pw & " | sudo -S bash -c 'echo \"ALL ALL=NOPASSWD: /usr/bin/pmset\" > /etc/sudoers.d/nosleep && chmod 444 /etc/sudoers.d/nosleep' 2>&1"
-    
+
     set check to do shell script "sudo -n pmset -g > /dev/null 2>&1 && echo OK || echo FAIL"
     if check is "OK" then
         display notification "免密配置成功 ✓" with title "合盖不休眠"
@@ -73,20 +125,6 @@ end if
 EOF
 }
 
-# ---- 检查 lidwatch 孤儿状态 ----
-fix_orphan_state() {
-    if [ -f "/tmp/no-sleep-lidwatch.pid" ]; then
-        local pid
-        pid=$(cat "/tmp/no-sleep-lidwatch.pid")
-        if ! kill -0 "$pid" 2>/dev/null; then
-            local disabled=$(/usr/bin/pmset -g 2>/dev/null | grep 'SleepDisabled' | awk '{print $2}')
-            if [ "$disabled" = "1" ]; then
-                log "⚠️ 孤儿状态：功能开启但 lidwatch 已死，menulet 会处理"
-            fi
-        fi
-    fi
-}
-
 # ---- 配置免密 ----
 log "检查免密状态..."
 
@@ -95,22 +133,57 @@ if ! has_nopasswd; then
     SETUP_RESULT=$(setup_nopasswd)
     if ! has_nopasswd; then
         log "免密配置失败，退出"
+        show_error "免密配置失败！\n\n可能原因：\n1. 密码输入错误\n2. 当前用户不是管理员\n\n请在终端手动执行：\nsudo echo 'ALL ALL=NOPASSWD: /usr/bin/pmset' > /etc/sudoers.d/nosleep"
         exit 1
     fi
 fi
+log "✅ 免密已配置"
 
-# 修复孤儿状态
-fix_orphan_state
+# ---- 6. 检查并修复孤儿状态 ----
+if [ -f "/tmp/no-sleep-lidwatch.pid" ]; then
+    pid=$(cat "/tmp/no-sleep-lidwatch.pid")
+    if ! kill -0 "$pid" 2>/dev/null; then
+        disabled=$(/usr/bin/pmset -g 2>/dev/null | grep 'SleepDisabled' | awk '{print $2}')
+        if [ "$disabled" = "1" ]; then
+            log "⚠️ 孤儿状态：功能开启但 lidwatch 已死，menulet 会处理"
+        fi
+    fi
+fi
 
-# ---- 启动 menulet（菜单栏常驻进程）----
-# 检查是否已经在运行
+# ---- 7. 检查是否已经在运行 ----
 if pgrep -f "合盖不休眠.app/Contents/MacOS/menulet" > /dev/null 2>&1; then
     log "menulet 已在运行，不重复启动"
-    /usr/bin/osascript -e 'display notification "已在菜单栏运行中" with title "合盖不休眠"'
+    show_notify "已在菜单栏运行中"
     exit 0
 fi
 
+# ---- 8. 启动 menulet ----
 log "启动 menulet（菜单栏常驻进程）"
 "$MENULET" &
-log "menulet 已启动，PID: $!"
+MENULET_PID=$!
+log "menulet 已启动，PID: $MENULET_PID"
+
+# ---- 9. 验证 menulet 是否成功启动 ----
+sleep 2
+
+if kill -0 "$MENULET_PID" 2>/dev/null; then
+    log "✅ menulet 运行正常"
+    show_notify "已启动，点菜单栏🌙图标操作"
+else
+    log "❌ menulet 启动后崩溃了！"
+    
+    # 检查崩溃原因
+    CRASH_LOG=$(ls -t ~/Library/Logs/DiagnosticReports/menulet* 2>/dev/null | head -1)
+    
+    ERROR_MSG="menulet 启动失败！\n\n可能原因：\n1. macOS 版本与 Swift 运行时不兼容\n2. 系统权限限制\n\n排错方法：\n在终端执行以下命令查看错误：\n\"$MENULET\""
+    
+    if [ -n "$CRASH_LOG" ]; then
+        log "崩溃日志: $CRASH_LOG"
+        ERROR_MSG="$ERROR_MSG\n\n崩溃日志：$CRASH_LOG"
+    fi
+    
+    show_error "$ERROR_MSG"
+    exit 1
+fi
+
 log "=== launch 退出（menulet 后台运行中）==="
