@@ -1527,6 +1527,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
         let wasSleepDisabled = Power.sleepDisabled
+        // 兼容从旧版升级：旧实例收到 terminate 后会把 disablesleep 设为 0 且不会写恢复标记。
+        // 在发送 terminate 前就先持久化恢复标记，即使等待超时后旧实例才退出，用户稍后重开新版也能正常恢复。
+        if wasSleepDisabled {
+            UserDefaults.standard.set(true, forKey: MenuBarController.restoreOnLaunchKey)
+        }
         others.forEach { $0.terminate() }
         let until = Date().addingTimeInterval(8)
         while others.contains(where: { !$0.isTerminated }) && Date() < until {
@@ -1540,10 +1545,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             timeout.addButton(withTitle: "好的")
             timeout.runModal()
             return false
-        }
-        // 兼容从旧版升级：旧实例退出时会把 disablesleep 设为 0 且不会写恢复标记，这里接力保留
-        if wasSleepDisabled {
-            UserDefaults.standard.set(true, forKey: MenuBarController.restoreOnLaunchKey)
         }
         Log.write("已替换正在运行的旧实例")
         return true
