@@ -23,10 +23,18 @@ final class MemDefaults: UserDefaults {
     override func removeObject(forKey k: String) { store[k] = nil }
     override func double(forKey k: String) -> Double { (store[k] as? NSNumber)?.doubleValue ?? 0 }
     override func integer(forKey k: String) -> Int { (store[k] as? NSNumber)?.intValue ?? 0 }
+    override func bool(forKey k: String) -> Bool { (store[k] as? NSNumber)?.boolValue ?? false }
     override func string(forKey k: String) -> String? { store[k] as? String }
     override func removePersistentDomain(forName domainName: String) { store = [:] }
 }
 enum SimDefaults { static let d: UserDefaults = MemDefaults(suiteName: nil)! }
+enum SimStatusBar {
+    static let item: NSStatusItem = {
+        let s = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        s.isVisible = false
+        return s
+    }()
+}
 
 // ---------- fake hardware / system ----------
 enum Power {
@@ -74,8 +82,10 @@ func run(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
 }
 
 var assertionsHeld = 0
+var failNextAssertion = 0
 @discardableResult
 func fakeAssertionCreate(_ type: CFString, _ level: IOPMAssertionLevel, _ name: CFString, _ id: UnsafeMutablePointer<IOPMAssertionID>) -> IOReturn {
+    if failNextAssertion > 0 { failNextAssertion -= 1; id.pointee = 0; ev("assertion → FAIL"); return kIOReturnError }
     assertionsHeld += 1; id.pointee = 42; ev("assertion +"); return kIOReturnSuccess
 }
 @discardableResult

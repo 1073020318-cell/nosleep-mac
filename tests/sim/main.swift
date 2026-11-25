@@ -17,20 +17,45 @@ func has(_ s: String) -> Bool { events().contains { $0.hasPrefix(s) } }
 func idx(_ s: String) -> Int? { events().firstIndex { $0.hasPrefix(s) } }
 
 var current: MenuBarController?
-func fresh(_ name: String, lid: Bool = false, sleep: Bool? = false, battery: (Bool, Int)? = (false, 100),
-           clamshell: Bool = true, threshold: Int? = nil, pre: () -> Void = {}) -> MenuBarController {
-    if let c = current { c.lidWatcher.stop(); c.countdownTimer?.invalidate(); c.statusTimer?.invalidate(); c.terminating = true }
+func teardownCurrent() {
+    if let c = current {
+        c.cancelPendingRestore()
+        c.lidWatcher.stop()
+        c.powerWatcher.stop()
+        c.countdownTimer?.invalidate()
+        c.statusTimer?.invalidate()
+        c.terminating = true
+        c.statusItem.menu = nil
+    }
     current = nil
     spin(0.1)
+}
+func fresh(_ name: String, lid: Bool = false, sleep: Bool? = false, battery: (Bool, Int)? = (false, 100),
+           clamshell: Bool = true, threshold: Int? = nil, pre: () -> Void = {}) -> MenuBarController {
+    teardownCurrent()
     SimDefaults.d.removePersistentDomain(forName: simSuite)
     Power.lid = lid; Power.sleepState = sleep; Power.clamshellCausesSleep = clamshell
     Power.batteryState = battery.map { (onBattery: $0.0, percent: $0.1) }; Power.legacy = .none
     Privileged.failNext = 0; Privileged.delay = 0; Privileged.adminFails = false
     Privileged.ownRuleInstalled = true; Privileged.legacyRulePresent = false
     Backlight.panel = 0.8; Backlight.failRestores = 0; Backlight.failDims = 0
-    FakeUI.responses = []; assertionsHeld = 0
+    FakeUI.responses = []; assertionsHeld = 0; failNextAssertion = 0
+    MenuBarController.restoreRetryDelay = 0.1
     if let t = threshold { SimDefaults.d.set(t, forKey: "batteryThreshold") }
     pre()
+    resetEvents()
+    scenarioName = name
+    let c = MenuBarController()
+    current = c
+    return c
+}
+/// 模拟系统重启/重新打开 App（保留持久化偏好设置，不清空 SimDefaults）
+func relaunch(_ name: String, lid: Bool = false, sleep: Bool? = false, battery: (Bool, Int)? = (false, 100),
+              clamshell: Bool = true) -> MenuBarController {
+    teardownCurrent()
+    Power.lid = lid; Power.sleepState = sleep; Power.clamshellCausesSleep = clamshell
+    Power.batteryState = battery.map { (onBattery: $0.0, percent: $0.1) }
+    assertionsHeld = 0; failNextAssertion = 0
     resetEvents()
     scenarioName = name
     let c = MenuBarController()
@@ -219,8 +244,93 @@ resetEvents(); c.uninstallApp(); spin(0.3)
 expect("文件删掉后：系统恢复休眠", Power.sleepState == false)
 expect("App 移到废纸篓并退出", has("recycle app") && has("terminate"))
 
+// 24
+c = fresh("24 系统重启/注销后自动恢复开启，拔电源合盖不休眠")
+turnOnAndWait(c)
+expect("开启后记下重启恢复标记", c.shouldRestoreOnLaunch)
+c.cleanupForExit(interactive: false)
+expect("重启/注销退出时先安全恢复正常休眠", Power.sleepState == false && assertionsHeld == 0)
+expect("非手动退出保留恢复标记", c.shouldRestoreOnLaunch)
+c = relaunch("24 系统重启/注销后自动恢复开启，拔电源合盖不休眠", lid: false, sleep: false, battery: (false, 100))
+waitFor(3) { c.isOn && !c.busy }
+expect("重启后自动恢复 disablesleep=1", c.isOn && Power.sleepState == true)
+expect("重启后重新持有防空闲睡眠断言", assertionsHeld == 1)
+expect("重启后合盖监听恢复运行", c.lidWatcher.isRunning)
+// 模拟夜间拔掉电源（99% 电池）再合盖
+Power.batteryState = (true, 99); c.checkBattery()
+setLid(c, true); waitFor(2) { Backlight.panel == 0 }
+expect("切换电池 99% 并合盖后仍保持开启且关闭背光", c.isOn && Power.sleepState == true && assertionsHeld == 1 && Backlight.panel == 0)
+
+// 25
+c = fresh("25 用户主动点「退出」后重开保持关闭")
+turnOnAndWait(c)
+c.cleanupForExit(interactive: true)
+expect("手动退出清除恢复标记", !c.shouldRestoreOnLaunch && Power.sleepState == false)
+c = relaunch("25 用户主动点「退出」后重开保持关闭", lid: false, sleep: false)
+spin(0.3)
+expect("再次打开保持关闭状态", !c.isOn && Power.sleepState == false && assertionsHeld == 0)
+
+// 26
+c = fresh("26 重启后首次恢复 sudo 失败 → 自动重试成功")
+turnOnAndWait(c)
+c.cleanupForExit(interactive: false)
+Privileged.failNext = 1
+c = relaunch("26 重启后首次恢复 sudo 失败 → 自动重试成功", lid: false, sleep: false)
+waitFor(3) { c.isOn && !c.busy }
+expect("第一次失败后重试成功恢复开启", c.isOn && Power.sleepState == true && assertionsHeld == 1 && has("sudo pmset disablesleep 1 → FAIL"))
+
+// 27
+c = fresh("27 重启后连续 3 次恢复失败 → 通知用户")
+turnOnAndWait(c)
+c.cleanupForExit(interactive: false)
+Privileged.failNext = 5
+c = relaunch("27 重启后连续 3 次恢复失败 → 通知用户", lid: false, sleep: false)
+waitFor(3) { has("NOTIFY 合盖不休眠未能自动恢复") }
+expect("3 次失败后通知用户而不静默关闭", !c.isOn && has("NOTIFY 合盖不休眠未能自动恢复") && !c.shouldRestoreOnLaunch)
+
+// 28
+c = fresh("28 重启期间原定时已过期 → 不自动恢复")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(-60)
+c.cleanupForExit(interactive: false)
+c = relaunch("28 重启期间原定时已过期 → 不自动恢复", lid: false, sleep: false)
+spin(0.3)
+expect("定时已过期时不恢复开启，并清掉定时与标记", !c.isOn && Power.sleepState == false && c.deadline == nil && !c.shouldRestoreOnLaunch)
+
+// 29
+c = fresh("29 重启后在用电池且电量低（15% ≤ 20%）→ 不自动恢复", threshold: 20)
+turnOnAndWait(c)
+c.cleanupForExit(interactive: false)
+c = relaunch("29 重启后在用电池且电量低（15% ≤ 20%）→ 不自动恢复", lid: false, sleep: false, battery: (true, 15))
+spin(0.3)
+expect("低电量时不自动恢复并发出通知", !c.isOn && Power.sleepState == false && has("NOTIFY 电量低") && !c.shouldRestoreOnLaunch)
+
+// 30
+c = fresh("30 重启前有未到期定时 → 重启后自动恢复并继续倒计时")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(120)
+c.cleanupForExit(interactive: false)
+c = relaunch("30 重启前有未到期定时 → 重启后自动恢复并继续倒计时", lid: false, sleep: false)
+waitFor(3) { c.isOn && !c.busy }
+expect("自动恢复开启且保留未到期定时与倒计时", c.isOn && Power.sleepState == true && (c.deadline?.timeIntervalSinceNow ?? 0) > 60 && c.countdownTimer != nil)
+
+// 31
+c = fresh("31 外部关闭 disablesleep → 同步关闭、清除恢复标记并通知")
+turnOnAndWait(c)
+Power.sleepState = false; c.syncWithSystem()
+expect("同步关闭并清除重启恢复标记", !c.isOn && !c.shouldRestoreOnLaunch)
+expect("发出外部关闭通知", has("NOTIFY 合盖不休眠已关闭"))
+
+// 32
+c = fresh("32 防空闲睡眠断言首次创建失败 → 定期同步自动补建")
+failNextAssertion = 1
+turnOnAndWait(c)
+expect("首次创建断言失败时记录为未持有", c.isOn && assertionsHeld == 0 && c.idleAssertion == 0)
+c.syncWithSystem()
+expect("syncWithSystem 自动补建防空闲睡眠断言", assertionsHeld == 1 && c.idleAssertion != 0)
+
 // ---------- report ----------
-current?.lidWatcher.stop(); current?.terminating = true
+teardownCurrent()
 SimDefaults.d.removePersistentDomain(forName: simSuite)
 // 清理测试程序自己留下的偏好文件（隐藏菜单栏图标的记录等）
 UserDefaults.standard.removePersistentDomain(forName: ProcessInfo.processInfo.processName)

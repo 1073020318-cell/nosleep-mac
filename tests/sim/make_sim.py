@@ -25,7 +25,7 @@ rep('"/tmp/nosleep_', '"%s/tmp_nosleep_' % simdir)
 rep('FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs", isDirectory: true)',
     'URL(fileURLWithPath: "%s", isDirectory: true)' % simdir, 1)
 rep('let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)',
-    'let statusItem: NSStatusItem = { let s = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength); s.isVisible = false; return s }()', 1)
+    'let statusItem: NSStatusItem = SimStatusBar.item', 1)
 # open up private members so the test can drive them
 s = re.sub(r'\bprivate (?!\()', '', s)
 # safety: nothing in the sim build may reach the real system layer
