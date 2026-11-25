@@ -481,9 +481,10 @@ final class LidWatcher {
         let oldNotifier = notifier, oldPort = port
         notifier = 0
         port = nil
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [self] in
             if oldNotifier != 0 { IOObjectRelease(oldNotifier) }
             if let p = oldPort { IONotificationPortDestroy(p) }
+            withExtendedLifetime(self) {}
         }
     }
 
@@ -683,6 +684,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusTimer?.invalidate()
         lidWatcher.stop()
         powerWatcher.stop()
+        if idleAssertion != 0 { IOPMAssertionRelease(idleAssertion) }
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -1062,6 +1064,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         shouldRestoreOnLaunch = actual
         if actual {
             startProtection()
+            if deadline != nil {
+                startCountdown()
+                tick()
+            }
         } else {
             cancelCountdown()
             stopProtection()
@@ -1321,8 +1327,17 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
         // 先恢复亮度（最要紧，且很快），注销/关机时系统可能等不了太久
         lidWatcher.stop()
         if backlight.isDimmed && !backlight.restore(wakeDisplay: Power.lidClosed != true) { Log.write("⚠️ 退出时恢复亮度失败") }
-        workQueue.sync {}   // 等正在执行的开/关命令结束
-        if !Power.sleepConfirmedEnabled && !Privileged.setSleepDisabled(false) && !Power.sleepConfirmedEnabled {
+        workQueue.sync {}
+        let beforeCleanup = Power.sleepDisabledReading
+        if !interactive {
+            if isOn && beforeCleanup == false {
+                shouldRestoreOnLaunch = false
+                cancelCountdown()
+            } else if busy && !isOn && beforeCleanup == true {
+                shouldRestoreOnLaunch = true
+            }
+        }
+        if beforeCleanup != false && !Privileged.setSleepDisabled(false) && !Power.sleepConfirmedEnabled {
             Log.write("⚠️ 退出时恢复休眠失败")
             if interactive {
                 if let err = Privileged.runAsAdmin("/usr/bin/pmset -a disablesleep 0", prompt: "「合盖不休眠」退出前需要恢复系统的正常休眠。") {
@@ -1517,7 +1532,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         while others.contains(where: { !$0.isTerminated }) && Date() < until {
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
-        others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+        guard !others.contains(where: { !$0.isTerminated }) else {
+            Log.write("旧实例尚未退出，取消接管")
+            let timeout = NSAlert()
+            timeout.messageText = "旧版尚未退出"
+            timeout.informativeText = "请等旧版退出后，再打开这个版本。"
+            timeout.addButton(withTitle: "好的")
+            timeout.runModal()
+            return false
+        }
         // 兼容从旧版升级：旧实例退出时会把 disablesleep 设为 0 且不会写恢复标记，这里接力保留
         if wasSleepDisabled {
             UserDefaults.standard.set(true, forKey: MenuBarController.restoreOnLaunchKey)

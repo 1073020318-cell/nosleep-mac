@@ -20,8 +20,8 @@ var current: MenuBarController?
 func teardownCurrent() {
     if let c = current {
         c.cancelPendingRestore()
+        c.stopProtection()
         c.lidWatcher.stop()
-        c.powerWatcher.stop()
         c.countdownTimer?.invalidate()
         c.statusTimer?.invalidate()
         c.terminating = true
@@ -286,7 +286,10 @@ c.cleanupForExit(interactive: false)
 Privileged.failNext = 5
 c = relaunch("27 重启后连续 3 次恢复失败 → 通知用户", lid: false, sleep: false)
 waitFor(3) { has("NOTIFY 合盖不休眠未能自动恢复") }
-expect("3 次失败后通知用户而不静默关闭", !c.isOn && has("NOTIFY 合盖不休眠未能自动恢复") && !c.shouldRestoreOnLaunch)
+let failedEnableAttempts = events().filter { $0 == "sudo pmset disablesleep 1 → FAIL" }
+expect("3 次失败后通知用户而不静默关闭",
+       failedEnableAttempts.count == 3 && !c.isOn && Power.sleepState == false
+       && has("NOTIFY 合盖不休眠未能自动恢复") && !c.shouldRestoreOnLaunch)
 
 // 28
 c = fresh("28 重启期间原定时已过期 → 不自动恢复")
@@ -328,6 +331,59 @@ turnOnAndWait(c)
 expect("首次创建断言失败时记录为未持有", c.isOn && assertionsHeld == 0 && c.idleAssertion == 0)
 c.syncWithSystem()
 expect("syncWithSystem 自动补建防空闲睡眠断言", assertionsHeld == 1 && c.idleAssertion != 0)
+
+// 33
+c = fresh("33 外部关闭后立即非手动退出 → 清除恢复标记与定时")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(600); c.startCountdown()
+Power.sleepState = false   // 模拟终端 pmset disablesleep 0，尚未触发 syncWithSystem
+c.cleanupForExit(interactive: false)
+expect("检测到系统已关闭，清除恢复标记与定时", !c.shouldRestoreOnLaunch && c.deadline == nil && c.countdownTimer == nil)
+c = relaunch("33 外部关闭后立即非手动退出 → 清除恢复标记与定时", lid: false, sleep: false)
+spin(0.3)
+expect("重开后保持关闭而不误恢复", !c.isOn && Power.sleepState == false && assertionsHeld == 0)
+
+// 34
+c = fresh("34 关闭命令执行中遇到非手动退出 → 不保留过期恢复标记")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(600); c.startCountdown()
+Privileged.delay = 0.25
+c.turnOff(reason: .user)
+c.cleanupForExit(interactive: false)
+expect("等待在途关闭完成后清除恢复标记与定时", !c.shouldRestoreOnLaunch && c.deadline == nil && Power.sleepState == false)
+Privileged.delay = 0
+c = relaunch("34 关闭命令执行中遇到非手动退出 → 不保留过期恢复标记", lid: false, sleep: false)
+spin(0.3)
+expect("重开后保持关闭而不误恢复", !c.isOn && Power.sleepState == false && assertionsHeld == 0)
+
+// 35
+c = fresh("35 开启命令执行中遇到非手动退出 → 保留恢复标记并安全恢复休眠")
+Privileged.delay = 0.25
+c.turnOn()
+c.cleanupForExit(interactive: false)
+expect("等待在途开启完成后记下恢复标记并恢复正常休眠", c.shouldRestoreOnLaunch && Power.sleepState == false)
+Privileged.delay = 0
+c = relaunch("35 开启命令执行中遇到非手动退出 → 保留恢复标记并安全恢复休眠", lid: false, sleep: false)
+waitFor(3) { c.isOn && !c.busy }
+expect("重开后自动恢复开启", c.isOn && Power.sleepState == true && assertionsHeld == 1)
+
+// 36
+c = fresh("36 重试窗口内外部/延迟恢复开启 → syncWithSystem 接管并启动原倒计时")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(120)
+c.cleanupForExit(interactive: false)
+Privileged.failNext = 1
+MenuBarController.restoreRetryDelay = 5.0
+c = relaunch("36 重试窗口内外部/延迟恢复开启 → syncWithSystem 接管并启动原倒计时", lid: false, sleep: false)
+waitFor(3) { !c.busy && c.pendingRestore != nil }
+expect("首次失败后处于重试等待且保留原定时", !c.isOn && c.pendingRestore != nil && c.deadline != nil && c.countdownTimer == nil)
+Power.sleepState = true
+c.syncWithSystem()
+expect("syncWithSystem 接管开启并启动保存的倒计时",
+       c.isOn && c.pendingRestore == nil && assertionsHeld == 1 && c.countdownTimer != nil && (c.deadline?.timeIntervalSinceNow ?? 0) > 60)
+c.deadline = Date().addingTimeInterval(0.3)
+waitFor(3) { !c.isOn }
+expect("接管后的倒计时正常到期关闭", !c.isOn && Power.sleepState == false && has("NOTIFY 定时到"))
 
 // ---------- report ----------
 teardownCurrent()
