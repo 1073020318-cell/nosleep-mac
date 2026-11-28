@@ -509,6 +509,8 @@ final class PowerSourceWatcher {
     var onChange: (() -> Void)?
     private var source: CFRunLoopSource?
 
+    var isRunning: Bool { source != nil }
+
     func start() {
         guard source == nil else { return }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -547,6 +549,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     let statusMenuItem = NSMenuItem(title: "检测中…", action: nil, keyEquivalent: "")
     let detailMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let toggleMenuItem = NSMenuItem(title: "开启合盖不休眠", action: #selector(toggleFeature), keyEquivalent: "")
+    let cancelPauseMenuItem = NSMenuItem(title: "取消自动恢复（保持关闭）", action: #selector(cancelLowBatteryPause), keyEquivalent: "")
     let timerMenuItem = NSMenuItem(title: "定时关闭", action: nil, keyEquivalent: "")
     let cancelTimerMenuItem = NSMenuItem(title: "取消定时", action: #selector(cancelAutoOff), keyEquivalent: "")
     let batteryMenuItem = NSMenuItem(title: "低电量保护", action: nil, keyEquivalent: "")
@@ -559,6 +562,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private(set) var isOn = false
     private var busy = false
+    private var pendingOffReason: OffReason?
     private var terminating = false
     private var uninstalled = false
     var userQuit = false
@@ -573,6 +577,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let workQueue = DispatchQueue(label: "nosleep.work")
 
     static let restoreOnLaunchKey = "restoreOnLaunch"
+    static let pausedForLowBatteryKey = "pausedForLowBattery"
     static var restoreRetryDelay: TimeInterval = 2.0
 
     private let timerOptions: [(String, Int)] = [("30 分钟", 30), ("1 小时", 60), ("2 小时", 120), ("4 小时", 240), ("8 小时", 480)]
@@ -584,6 +589,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         set {
             if newValue { defaults.set(true, forKey: Self.restoreOnLaunchKey) }
             else { defaults.removeObject(forKey: Self.restoreOnLaunchKey) }
+        }
+    }
+
+    /// 低电量保护临时暂停中：接通电源或电量恢复到阈值以上后自动重新开启
+    var pausedForLowBattery: Bool {
+        get { (defaults.object(forKey: Self.pausedForLowBatteryKey) as? Bool) ?? false }
+        set {
+            if newValue { defaults.set(true, forKey: Self.pausedForLowBatteryKey) }
+            else { defaults.removeObject(forKey: Self.pausedForLowBatteryKey) }
         }
     }
 
@@ -621,6 +635,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         // 系统里已经是开启状态（App 崩溃后重新打开、旧版被强制退出等）→ 接管，继续合盖关屏
         isOn = Power.sleepDisabled
         if isOn {
+            pausedForLowBattery = false
             shouldRestoreOnLaunch = true
             Log.write("启动时检测到已开启，接管合盖监听")
             startProtection()
@@ -629,26 +644,32 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 startCountdown()
                 tick()
             }
-        } else if shouldRestoreOnLaunch {
+        } else if shouldRestoreOnLaunch || pausedForLowBattery {
             // 屏幕还是黑的（盖子合着或恢复失败）：先保持监听，等开盖时恢复
             if backlight.isDimmed { lidWatcher.start() }
             if let d = deadline, d.timeIntervalSinceNow <= 0 {
                 Log.write("启动时原定时已到期，不再自动恢复")
                 deadline = nil
+                pausedForLowBattery = false
                 shouldRestoreOnLaunch = false
+                powerWatcher.stop()
             } else if let b = Power.battery(), b.onBattery, batteryThreshold > 0, b.percent <= batteryThreshold {
-                Log.write("启动时电量 \(b.percent)% ≤ \(batteryThreshold)%，不自动恢复")
-                deadline = nil
-                shouldRestoreOnLaunch = false
-                notify("电量低", "重启后电量只剩 \(b.percent)%，未自动恢复合盖不休眠")
+                Log.write("启动时电量 \(b.percent)% ≤ \(batteryThreshold)%，保持低电量暂停等待电源恢复")
+                pausedForLowBattery = true
+                shouldRestoreOnLaunch = true
+                powerWatcher.start()
+                notify("电量低（已暂停）", "当前电量 \(b.percent)%，合盖不休眠已暂停；接通电源或电量恢复后将自动重新开启")
             } else if !(Privileged.ownRuleInstalled || Privileged.legacyRulePresent) {
                 Log.write("启动时缺少免密配置，无法自动恢复")
                 deadline = nil
+                pausedForLowBattery = false
                 shouldRestoreOnLaunch = false
+                powerWatcher.stop()
                 notify("合盖不休眠未自动恢复", "缺少免密配置，请点击菜单栏重新开启")
             } else {
-                Log.write("检测到重启/重新打开前曾开启，正在自动恢复合盖不休眠")
-                restoreOnLaunch(attempt: 1)
+                let wasPaused = pausedForLowBattery
+                Log.write(wasPaused ? "启动时电源/电量已恢复，正在自动恢复合盖不休眠" : "检测到重启/重新打开前曾开启，正在自动恢复合盖不休眠")
+                restoreOnLaunch(attempt: 1, fromBatteryPause: wasPaused)
             }
         } else {
             deadline = nil
@@ -731,6 +752,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         toggleMenuItem.target = self
         menu.addItem(toggleMenuItem)
 
+        cancelPauseMenuItem.target = self
+        cancelPauseMenuItem.isHidden = true
+        menu.addItem(cancelPauseMenuItem)
+
         for (label, minutes) in timerOptions {
             let item = NSMenuItem(title: label, action: #selector(setAutoOff(_:)), keyEquivalent: "")
             item.target = self
@@ -790,6 +815,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if isOn { turnOff(reason: .user) } else { turnOn() }
     }
 
+    @objc func cancelLowBatteryPause() {
+        guard !busy else { return }
+        cancelPendingRestore()
+        pausedForLowBattery = false
+        shouldRestoreOnLaunch = false
+        cancelCountdown()
+        powerWatcher.stop()
+        Log.write("已取消低电量自动恢复（手动）")
+        updateUI()
+    }
+
     /// 确保免密配置可用；需要时弹出系统授权窗口。返回 false 表示用户取消或失败。
     private func ensureSetup() -> Bool {
         if Privileged.ownRuleInstalled || Privileged.legacyRulePresent { return true }
@@ -825,6 +861,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self.busy = false
                 if ok {
                     self.isOn = true
+                    self.pausedForLowBattery = false
                     self.shouldRestoreOnLaunch = true
                     Log.write("已开启")
                     if completion == nil { self.cancelCountdown() }   // 普通开启不继承旧的定时
@@ -838,21 +875,34 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// 重启/注销/升级后自动恢复开启状态（最多尝试 3 次，避免开机初期 powerd 尚未就绪）
-    private func restoreOnLaunch(attempt: Int) {
-        guard !terminating, !isOn, shouldRestoreOnLaunch else { return }
+    /// 重启/注销/升级或低电量暂停恢复后自动开启（最多尝试 3 次，避免开机/唤醒初期 powerd 尚未就绪）
+    private func restoreOnLaunch(attempt: Int, fromBatteryPause: Bool = false) {
+        guard !terminating, !isOn, (shouldRestoreOnLaunch || pausedForLowBattery) else { return }
         if let d = deadline, d.timeIntervalSinceNow <= 0 {
             Log.write("恢复期间原定时已到期，取消自动恢复")
             deadline = nil
+            pausedForLowBattery = false
             shouldRestoreOnLaunch = false
+            powerWatcher.stop()
             updateUI()
             return
         }
         if let b = Power.battery(), b.onBattery, batteryThreshold > 0, b.percent <= batteryThreshold {
-            Log.write("恢复期间电量 \(b.percent)% ≤ \(batteryThreshold)%，取消自动恢复")
+            Log.write("恢复期间电量 \(b.percent)% ≤ \(batteryThreshold)%，保持低电量暂停等待电源恢复")
+            pausedForLowBattery = true
+            shouldRestoreOnLaunch = true
+            powerWatcher.start()
+            notify("电量低（已暂停）", "当前电量 \(b.percent)%，合盖不休眠已暂停；接通电源或电量恢复后将自动重新开启")
+            updateUI()
+            return
+        }
+        guard Privileged.ownRuleInstalled || Privileged.legacyRulePresent else {
+            Log.write("恢复期间缺少免密配置，无法自动恢复")
             deadline = nil
+            pausedForLowBattery = false
             shouldRestoreOnLaunch = false
-            notify("电量低", "电量只剩 \(b.percent)%，未自动恢复合盖不休眠")
+            powerWatcher.stop()
+            notify("合盖不休眠未自动恢复", "缺少免密配置，请点击菜单栏重新开启")
             updateUI()
             return
         }
@@ -865,8 +915,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self.busy = false
                 if ok {
                     self.isOn = true
+                    self.pausedForLowBattery = false
                     self.shouldRestoreOnLaunch = true
-                    Log.write("重启/重新打开后已自动恢复开启")
+                    if fromBatteryPause {
+                        Log.write("电源/电量已恢复，自动重新开启合盖不休眠")
+                        self.notify("合盖不休眠已自动恢复", "电源或电量已恢复，合盖不休眠已重新开启")
+                    } else {
+                        Log.write("重启/重新打开后已自动恢复开启")
+                    }
                     self.startProtection()
                     if self.deadline != nil {
                         self.startCountdown()
@@ -876,15 +932,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                     Log.write("⚠️ 自动恢复开启失败（第 \(attempt) 次），稍后重试")
                     let work = DispatchWorkItem { [weak self] in
                         self?.pendingRestore = nil
-                        self?.restoreOnLaunch(attempt: attempt + 1)
+                        self?.restoreOnLaunch(attempt: attempt + 1, fromBatteryPause: fromBatteryPause)
                     }
                     self.pendingRestore = work
                     DispatchQueue.main.asyncAfter(deadline: .now() + Self.restoreRetryDelay, execute: work)
                 } else {
                     Log.write("⚠️ 自动恢复合盖不休眠失败（已重试 3 次），请手动开启")
                     self.deadline = nil
+                    self.pausedForLowBattery = false
                     self.shouldRestoreOnLaunch = false
-                    self.notify("合盖不休眠未能自动恢复", "重启后恢复失败，请点击菜单栏图标重新开启")
+                    self.powerWatcher.stop()
+                    self.notify("合盖不休眠未能自动恢复", fromBatteryPause ? "电源恢复后重新开启失败，请点击菜单栏图标手动开启" : "重启后恢复失败，请点击菜单栏图标重新开启")
                 }
                 self.updateUI()
             }
@@ -899,26 +957,45 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     func turnOff(reason: OffReason) {
         guard !busy, isOn else { return }
         busy = true
+        pendingOffReason = reason
         updateUI()
         workQueue.async { [weak self] in
             let ok = Privileged.setSleepDisabled(false)
             DispatchQueue.main.async {
                 guard let self = self, !self.terminating else { return }
                 self.busy = false
+                self.pendingOffReason = nil
                 // 再读一次：系统属性更新慢时，命令其实已经生效
                 if ok || Power.sleepConfirmedEnabled {
                     self.isOn = false
-                    self.shouldRestoreOnLaunch = false
-                    self.cancelCountdown()
-                    Log.write("已关闭（\(reason.rawValue)）")
                     // 盖子合着时自动关闭：让电脑立即睡眠（外接显示器的合盖模式除外）。
                     // 睡眠前先恢复亮度，这样唤醒后不需要再做任何事。
                     let willSleep = reason != .user && Power.lidClosed == true && Power.clamshellCausesSleep
-                    self.stopProtection(restoreWhileClosed: willSleep)
-                    switch reason {
-                    case .timer: self.notify("定时到", "合盖不休眠已自动关闭，电脑恢复正常休眠")
-                    case .battery: self.notify("电量低", "合盖不休眠已自动关闭，避免电池耗尽")
-                    case .user: break
+                    if reason == .battery {
+                        if let d = self.deadline, d.timeIntervalSinceNow <= 0 {
+                            self.cancelCountdown()
+                            self.pausedForLowBattery = false
+                            self.shouldRestoreOnLaunch = false
+                            Log.write("已关闭（低电量，且原定时已到期）")
+                            self.stopProtection(restoreWhileClosed: willSleep, keepPowerWatcher: false)
+                            self.notify("电量低", "合盖不休眠已自动关闭，避免电池耗尽")
+                        } else {
+                            self.pauseCountdown()
+                            self.pausedForLowBattery = true
+                            self.shouldRestoreOnLaunch = true
+                            Log.write("已暂停（低电量，电源恢复后自动重新开启）")
+                            self.stopProtection(restoreWhileClosed: willSleep, keepPowerWatcher: true)
+                            self.notify("电量低（已暂停）", "合盖不休眠已临时暂停以保护电池；接通电源或电量恢复后将自动重新开启")
+                        }
+                    } else {
+                        self.pausedForLowBattery = false
+                        self.shouldRestoreOnLaunch = false
+                        self.cancelCountdown()
+                        Log.write("已关闭（\(reason.rawValue)）")
+                        self.stopProtection(restoreWhileClosed: willSleep, keepPowerWatcher: false)
+                        if reason == .timer {
+                            self.notify("定时到", "合盖不休眠已自动关闭，电脑恢复正常休眠")
+                        }
                     }
                     if willSleep {
                         Log.write("盖子合着，让电脑进入睡眠")
@@ -966,12 +1043,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     /// restoreWhileClosed：盖子合着也立即恢复亮度（只用于马上要睡眠的情况）。
     /// 否则盖子合着时保持黑屏，等开盖再恢复。
-    private func stopProtection(restoreWhileClosed: Bool = false) {
+    /// keepPowerWatcher：低电量暂停时保持电源监听，以便插电或充电后自动恢复。
+    private func stopProtection(restoreWhileClosed: Bool = false, keepPowerWatcher: Bool = false) {
         if idleAssertion != 0 {
             IOPMAssertionRelease(idleAssertion)
             idleAssertion = 0
         }
-        powerWatcher.stop()
+        if keepPowerWatcher {
+            powerWatcher.start()
+        } else {
+            powerWatcher.stop()
+        }
         pendingDim?.cancel()
         pendingDim = nil
         dimFailures = 0
@@ -1028,10 +1110,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// 系统唤醒：同时检查背光恢复和系统休眠状态
+    /// 系统唤醒：同时检查背光恢复、系统休眠状态与低电量暂停恢复
     @objc private func systemDidWake() {
         displayMayBeBack()
         syncWithSystem()
+        if !isOn && pausedForLowBattery { checkBattery() }
     }
 
     /// 系统即将注销/重启/关机：先清理系统状态，但保留「重启后自动恢复」标记
@@ -1055,6 +1138,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             if isOn {
                 ensureIdleAssertion()
                 checkBattery()
+            } else if pausedForLowBattery {
+                checkBattery()
             }
             return
         }
@@ -1062,6 +1147,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         Log.write("系统状态与 App 不一致，已同步为 \(actual ? "开启" : "关闭")")
         isOn = actual
         shouldRestoreOnLaunch = actual
+        pausedForLowBattery = false
         if actual {
             startProtection()
             if deadline != nil {
@@ -1107,6 +1193,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         countdownTimer = timer
     }
 
+    private func pauseCountdown() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        timerRetryAt = nil
+    }
+
     private func cancelCountdown() {
         countdownTimer?.invalidate()
         countdownTimer = nil
@@ -1142,14 +1234,48 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func checkBattery() {
-        guard isOn, batteryThreshold > 0, let b = Power.battery() else { return }
-        if !b.onBattery || b.percent > batteryThreshold {
-            batteryArmed = true
-        } else if batteryArmed && !busy {
-            Log.write("电量 \(b.percent)% ≤ \(batteryThreshold)%，自动关闭")
-            batteryArmed = false
-            turnOff(reason: .battery)
+        if isOn {
+            guard batteryThreshold > 0, let b = Power.battery() else { return }
+            if !b.onBattery || b.percent > batteryThreshold {
+                batteryArmed = true
+            } else if batteryArmed && !busy {
+                Log.write("电量 \(b.percent)% ≤ \(batteryThreshold)%，自动暂停")
+                batteryArmed = false
+                turnOff(reason: .battery)
+            }
+            return
         }
+        guard pausedForLowBattery, !busy, !terminating, pendingRestore == nil else { return }
+        if let d = deadline, d.timeIntervalSinceNow <= 0 {
+            Log.write("低电量暂停期间原定时已到期，取消自动恢复")
+            cancelCountdown()
+            pausedForLowBattery = false
+            shouldRestoreOnLaunch = false
+            powerWatcher.stop()
+            updateUI()
+            return
+        }
+        let recovered: Bool
+        if batteryThreshold == 0 {
+            recovered = true
+        } else if let b = Power.battery() {
+            recovered = !b.onBattery || b.percent > batteryThreshold
+        } else {
+            recovered = true
+        }
+        guard recovered else { return }
+        guard Privileged.ownRuleInstalled || Privileged.legacyRulePresent else {
+            Log.write("电源恢复时缺少免密配置，无法自动恢复")
+            cancelCountdown()
+            pausedForLowBattery = false
+            shouldRestoreOnLaunch = false
+            powerWatcher.stop()
+            notify("合盖不休眠未自动恢复", "缺少免密配置，请点击菜单栏重新开启")
+            updateUI()
+            return
+        }
+        Log.write("检测到电源/电量已恢复，正在自动重新开启合盖不休眠")
+        restoreOnLaunch(attempt: 1, fromBatteryPause: true)
     }
 
     // ------------------------------------------------------------
@@ -1199,31 +1325,49 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func updateCountdown() {
         let remaining = deadline?.timeIntervalSinceNow ?? 0
         let hasTimer = isOn && deadline != nil
+        let isPaused = !isOn && pausedForLowBattery
+        let hasPausedTimer = isPaused && deadline != nil && remaining > 0
 
         var details: [String] = []
         if hasTimer {
             details.append(remaining > 0 ? "⏱ \(formatRemaining(remaining)) 后自动关闭" : "⏱ 正在自动关闭…")
+        } else if hasPausedTimer {
+            details.append("⏱ 原定时剩余 \(formatRemaining(remaining))（恢复后继续）")
         }
         if isOn && !backlight.available { details.append("⚠️ 无法控制屏幕亮度，合盖后屏幕可能不灭") }
         detailMenuItem.title = details.joined(separator: "  ·  ")
         detailMenuItem.isHidden = details.isEmpty
 
         timerMenuItem.title = hasTimer && remaining > 0 ? "定时关闭（剩余 \(formatRemaining(remaining))）" : "定时关闭"
-        cancelTimerMenuItem.isEnabled = hasTimer && !busy
+        cancelTimerMenuItem.isEnabled = (hasTimer || hasPausedTimer) && !busy
 
-        var tip = isOn ? "合盖不休眠 — 已开启" : "合盖不休眠 — 已关闭"
-        if hasTimer && remaining > 0 { tip += " ⏱ \(formatRemaining(remaining))" }
+        var tip: String
+        if isOn {
+            tip = "合盖不休眠 — 已开启"
+            if hasTimer && remaining > 0 { tip += " ⏱ \(formatRemaining(remaining))" }
+        } else if isPaused {
+            tip = "合盖不休眠 — 低电量暂停（充电后自动恢复）"
+        } else {
+            tip = "合盖不休眠 — 已关闭"
+        }
         if statusItem.button?.toolTip != tip { statusItem.button?.toolTip = tip }
     }
 
     func updateUI() {
+        let isPaused = !isOn && pausedForLowBattery
         if busy {
             statusMenuItem.title = isOn ? "⏳ 正在关闭…" : "⏳ 正在开启…"
+        } else if isOn {
+            statusMenuItem.title = "✅ 已开启 — 合盖后继续运行，自动关屏"
+        } else if isPaused {
+            statusMenuItem.title = "⏸ 已因低电量暂停 — 接通电源或充电后自动恢复"
         } else {
-            statusMenuItem.title = isOn ? "✅ 已开启 — 合盖后继续运行，自动关屏" : "❌ 已关闭 — 正常休眠"
+            statusMenuItem.title = "❌ 已关闭 — 正常休眠"
         }
-        toggleMenuItem.title = isOn ? "关闭合盖不休眠" : "开启合盖不休眠"
+        toggleMenuItem.title = isOn ? "关闭合盖不休眠" : (isPaused ? "立即开启合盖不休眠" : "开启合盖不休眠")
         toggleMenuItem.isEnabled = !busy
+        cancelPauseMenuItem.isHidden = !isPaused
+        cancelPauseMenuItem.isEnabled = isPaused && !busy
         for item in timerSubMenu.items where item.representedObject != nil { item.isEnabled = !busy }
 
         batteryMenuItem.title = batteryThreshold > 0 ? "低电量保护（\(batteryThreshold)%）" : "低电量保护（未启用）"
@@ -1323,18 +1467,36 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
         guard !uninstalled, !terminating else { return }
         terminating = true
         cancelPendingRestore()
-        if interactive { shouldRestoreOnLaunch = false }
+        if interactive {
+            shouldRestoreOnLaunch = false
+            pausedForLowBattery = false
+            cancelCountdown()
+        }
         // 先恢复亮度（最要紧，且很快），注销/关机时系统可能等不了太久
         lidWatcher.stop()
+        powerWatcher.stop()
         if backlight.isDimmed && !backlight.restore(wakeDisplay: Power.lidClosed != true) { Log.write("⚠️ 退出时恢复亮度失败") }
         workQueue.sync {}
         let beforeCleanup = Power.sleepDisabledReading
         if !interactive {
             if isOn && beforeCleanup == false {
-                shouldRestoreOnLaunch = false
-                cancelCountdown()
+                if pendingOffReason == .battery {
+                    if let d = deadline, d.timeIntervalSinceNow <= 0 {
+                        pausedForLowBattery = false
+                        shouldRestoreOnLaunch = false
+                        cancelCountdown()
+                    } else {
+                        pausedForLowBattery = true
+                        shouldRestoreOnLaunch = true
+                    }
+                } else {
+                    shouldRestoreOnLaunch = false
+                    pausedForLowBattery = false
+                    cancelCountdown()
+                }
             } else if busy && !isOn && beforeCleanup == true {
                 shouldRestoreOnLaunch = true
+                pausedForLowBattery = false
             }
         }
         if beforeCleanup != false && !Privileged.setSleepDisabled(false) && !Power.sleepConfirmedEnabled {
@@ -1387,6 +1549,7 @@ MacBook 合盖后保持运行，自动关闭屏幕省电。
         uninstalled = true
         terminating = true   // 之后到达的开/关回调一律忽略
         cancelPendingRestore()
+        pausedForLowBattery = false
         shouldRestoreOnLaunch = false
         cancelCountdown()
         isOn = false

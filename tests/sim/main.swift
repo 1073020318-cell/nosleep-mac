@@ -141,13 +141,20 @@ c.deadline = Date().addingTimeInterval(0.3); c.startCountdown(); waitFor(3) { !c
 expect("定时到期不强制睡眠（你可能正在用外接显示器）", !has("run /usr/bin/pmset sleepnow"))
 
 // 10
-c = fresh("10 合盖用电池，电量降到 19%", battery: (true, 50), threshold: 20)
+c = fresh("10 合盖用电池，电量降到 19%（低电量暂停）", battery: (true, 50), threshold: 20)
 turnOnAndWait(c); setLid(c, true); waitFor { Backlight.panel == 0 }
 Power.batteryState = (true, 19); c.checkBattery()      // = 系统电量变化回调
 waitFor(3) { !c.isOn }; spin(0.3)
-expect("自动关闭", Power.sleepState == false)
-expect("发出「电量低」通知", has("NOTIFY 电量低"))
+expect("自动关闭 disablesleep 并进入低电量暂停", Power.sleepState == false && c.pausedForLowBattery && c.shouldRestoreOnLaunch)
+expect("保持电源监听且释放防空闲睡眠断言", c.powerWatcher.isRunning && assertionsHeld == 0)
+expect("发出「电量低（已暂停）」通知", has("NOTIFY 电量低（已暂停）"))
 expect("恢复亮度后让电脑睡眠", Backlight.panel == 0.8 && has("run /usr/bin/pmset sleepnow"))
+expect("菜单显示暂停状态与取消自动恢复入口",
+       c.statusMenuItem.title.contains("已因低电量暂停")
+       && c.toggleMenuItem.title == "立即开启合盖不休眠"
+       && !c.cancelPauseMenuItem.isHidden
+       && c.cancelPauseMenuItem.isEnabled
+       && c.statusItem.button?.toolTip == "合盖不休眠 — 低电量暂停（充电后自动恢复）")
 
 // 11
 c = fresh("11 接着电源时电量低", battery: (false, 10), threshold: 20)
@@ -301,12 +308,14 @@ spin(0.3)
 expect("定时已过期时不恢复开启，并清掉定时与标记", !c.isOn && Power.sleepState == false && c.deadline == nil && !c.shouldRestoreOnLaunch)
 
 // 29
-c = fresh("29 重启后在用电池且电量低（15% ≤ 20%）→ 不自动恢复", threshold: 20)
+c = fresh("29 重启后在用电池且电量低（15% ≤ 20%）→ 保持低电量暂停等待恢复", threshold: 20)
 turnOnAndWait(c)
 c.cleanupForExit(interactive: false)
-c = relaunch("29 重启后在用电池且电量低（15% ≤ 20%）→ 不自动恢复", lid: false, sleep: false, battery: (true, 15))
+c = relaunch("29 重启后在用电池且电量低（15% ≤ 20%）→ 保持低电量暂停等待恢复", lid: false, sleep: false, battery: (true, 15))
 spin(0.3)
-expect("低电量时不自动恢复并发出通知", !c.isOn && Power.sleepState == false && has("NOTIFY 电量低") && !c.shouldRestoreOnLaunch)
+expect("低电量时保持暂停、保留恢复意图、保持电源监听并发出通知",
+       !c.isOn && Power.sleepState == false && c.pausedForLowBattery && c.shouldRestoreOnLaunch
+       && c.powerWatcher.isRunning && has("NOTIFY 电量低（已暂停）"))
 
 // 30
 c = fresh("30 重启前有未到期定时 → 重启后自动恢复并继续倒计时")
@@ -384,6 +393,185 @@ expect("syncWithSystem 接管开启并启动保存的倒计时",
 c.deadline = Date().addingTimeInterval(0.3)
 waitFor(3) { !c.isOn }
 expect("接管后的倒计时正常到期关闭", !c.isOn && Power.sleepState == false && has("NOTIFY 定时到"))
+
+// 37
+c = fresh("37 低电量暂停后接通电源 → 自动重新开启", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 20); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Power.batteryState = (false, 20); c.checkBattery()
+waitFor(3) { c.isOn && !c.busy }
+expect("接通电源后自动恢复 disablesleep=1、断言与合盖监听",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery && c.shouldRestoreOnLaunch
+       && assertionsHeld == 1 && c.lidWatcher.isRunning && c.cancelPauseMenuItem.isHidden)
+expect("发出「合盖不休眠已自动恢复」通知", has("NOTIFY 合盖不休眠已自动恢复"))
+
+// 38
+c = fresh("38 低电量暂停 → 充电到 91% 后重启（电池 91%）→ 启动时自动恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 20); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+c.cleanupForExit(interactive: false)
+expect("非手动退出保留低电量暂停与恢复标记", c.pausedForLowBattery && c.shouldRestoreOnLaunch && !c.powerWatcher.isRunning)
+c = relaunch("38 低电量暂停 → 充电到 91% 后重启（电池 91%）→ 启动时自动恢复", lid: false, sleep: false, battery: (true, 91))
+waitFor(3) { c.isOn && !c.busy }
+expect("重启后电池 91% 自动恢复开启并持有断言与合盖监听",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery && c.shouldRestoreOnLaunch
+       && assertionsHeld == 1 && c.lidWatcher.isRunning && has("NOTIFY 合盖不休眠已自动恢复"))
+
+// 39
+c = fresh("39 低电量暂停后深度睡眠唤醒（无 IOPS 回调）→ systemDidWake 自动恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Power.batteryState = (false, 25)
+c.systemDidWake()
+waitFor(3) { c.isOn && !c.busy }
+expect("唤醒后自动恢复开启", c.isOn && Power.sleepState == true && !c.pausedForLowBattery && assertionsHeld == 1 && has("NOTIFY 合盖不休眠已自动恢复"))
+
+// 40
+c = fresh("40 低电量暂停后用户点击「取消自动恢复」→ 插电和重启均保持关闭", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(600); c.startCountdown()
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+c.cancelLowBatteryPause()
+expect("取消后清除暂停、恢复标记、定时并停止电源监听",
+       !c.pausedForLowBattery && !c.shouldRestoreOnLaunch && c.deadline == nil
+       && !c.powerWatcher.isRunning && c.cancelPauseMenuItem.isHidden)
+Power.batteryState = (false, 80); c.checkBattery(); spin(0.3)
+expect("接通电源后保持关闭", !c.isOn && Power.sleepState == false)
+c = relaunch("40 低电量暂停后用户点击「取消自动恢复」→ 插电和重启均保持关闭", lid: false, sleep: false, battery: (false, 100))
+spin(0.3)
+expect("重启后仍保持关闭", !c.isOn && Power.sleepState == false && assertionsHeld == 0)
+
+// 41
+c = fresh("41 低电量暂停期间用户主动点「退出」→ 重开接电源保持关闭", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+c.cleanupForExit(interactive: true)
+expect("手动退出清除暂停与恢复标记", !c.pausedForLowBattery && !c.shouldRestoreOnLaunch && !c.powerWatcher.isRunning)
+c = relaunch("41 低电量暂停期间用户主动点「退出」→ 重开接电源保持关闭", lid: false, sleep: false, battery: (false, 100))
+spin(0.3)
+expect("重开后保持关闭", !c.isOn && Power.sleepState == false && assertionsHeld == 0)
+
+// 42
+c = fresh("42 低电量暂停期间调低或关闭低电量阈值 → 立即自动恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+let thresh10 = NSMenuItem(); thresh10.representedObject = 10
+resetEvents()
+c.setBatteryThreshold(thresh10)
+waitFor(3) { c.isOn && !c.busy }
+expect("阈值从 20% 调低到 10%（当前 15%）→ 立即自动恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery && has("NOTIFY 合盖不休眠已自动恢复"))
+// 再触发一次暂停后把阈值设为「不启用」(0%)
+Power.batteryState = (true, 8); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+let thresh0 = NSMenuItem(); thresh0.representedObject = 0
+resetEvents()
+c.setBatteryThreshold(thresh0)
+waitFor(3) { c.isOn && !c.busy }
+expect("阈值设为「不启用」(0%) → 立即自动恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery && has("NOTIFY 合盖不休眠已自动恢复"))
+
+// 43
+c = fresh("43 低电量暂停与定时关闭交互（未到期继续 / 已到期取消）", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(300); c.startCountdown()
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+expect("暂停时保留未到期定时、停掉倒计时器并显示剩余时间",
+       c.deadline != nil && c.countdownTimer == nil
+       && !c.detailMenuItem.isHidden && c.detailMenuItem.title.contains("原定时剩余"))
+Power.batteryState = (false, 50); c.checkBattery()
+waitFor(3) { c.isOn && !c.busy }
+expect("恢复开启后继续原定时倒计时", c.isOn && c.deadline != nil && c.countdownTimer != nil)
+// 再次暂停并模拟暂停期间定时到期
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+c.deadline = Date().addingTimeInterval(-10)
+resetEvents()
+Power.batteryState = (false, 80); c.checkBattery(); spin(0.3)
+expect("暂停期间定时已到期 → 不自动恢复并清除状态",
+       !c.isOn && Power.sleepState == false && !c.pausedForLowBattery && !c.shouldRestoreOnLaunch
+       && c.deadline == nil && !c.powerWatcher.isRunning)
+
+// 44
+c = fresh("44 低电量恢复时 sudo 失败重试（1 次成功 / 3 次放弃并通知）", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Privileged.failNext = 1
+Power.batteryState = (false, 30); c.checkBattery()
+waitFor(3) { c.isOn && !c.busy }
+expect("1 次失败后重试成功恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery && has("sudo pmset disablesleep 1 → FAIL") && has("NOTIFY 合盖不休眠已自动恢复"))
+// 再触发暂停，模拟连续 3 次失败
+Power.batteryState = (true, 18); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Privileged.failNext = 5
+Power.batteryState = (false, 30); c.checkBattery()
+waitFor(3) { has("NOTIFY 合盖不休眠未能自动恢复") }
+let resumeFailCount = events().filter { $0 == "sudo pmset disablesleep 1 → FAIL" }.count
+expect("连续 3 次失败后通知用户、清除状态并停止电源监听",
+       resumeFailCount == 3 && !c.isOn && Power.sleepState == false
+       && !c.pausedForLowBattery && !c.shouldRestoreOnLaunch && !c.powerWatcher.isRunning)
+
+// 45
+c = fresh("45 低电量暂停期间用户手动坚持开启 → 清除暂停状态并保持开启", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+FakeUI.responses = [.alertFirstButtonReturn]
+turnOnAndWait(c)
+expect("手动确认后开启并清除低电量暂停标记",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery && c.shouldRestoreOnLaunch
+       && has("ALERT 电量只剩 15%") && c.cancelPauseMenuItem.isHidden)
+Power.batteryState = (true, 14); c.checkBattery(); spin(0.3)
+expect("电量继续降到 14% 仍保持开启（本次已确认忽略）", c.isOn && Power.sleepState == true)
+
+// 46
+c = fresh("46 低电量暂停后重启时仍为低电量 → 保持暂停 → 接电自动恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+c.cleanupForExit(interactive: false)
+c = relaunch("46 低电量暂停后重启时仍为低电量 → 保持暂停 → 接电自动恢复", lid: false, sleep: false, battery: (true, 15))
+spin(0.3)
+expect("重启时仍为 15% → 保持低电量暂停且电源监听运行中",
+       !c.isOn && Power.sleepState == false && c.pausedForLowBattery && c.shouldRestoreOnLaunch && c.powerWatcher.isRunning)
+resetEvents()
+Power.batteryState = (false, 16); c.checkBattery()
+waitFor(3) { c.isOn && !c.busy }
+expect("接通电源后自动恢复开启", c.isOn && Power.sleepState == true && !c.pausedForLowBattery && assertionsHeld == 1 && has("NOTIFY 合盖不休眠已自动恢复"))
+
+// 47
+c = fresh("47 低电量暂停恢复时缺少免密配置 → 清除状态并通知", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Privileged.ownRuleInstalled = false
+Power.batteryState = (false, 50); c.checkBattery(); spin(0.3)
+expect("缺少免密配置时不开启、清除标记并通知",
+       !c.isOn && Power.sleepState == false && !c.pausedForLowBattery && !c.shouldRestoreOnLaunch
+       && !c.powerWatcher.isRunning && has("NOTIFY 合盖不休眠未自动恢复"))
+
+// 48
+c = fresh("48 低电量暂停期间外部开启 disablesleep → syncWithSystem 接管并清除暂停标记", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.checkBattery()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+Power.batteryState = (false, 50)
+Power.sleepState = true
+c.syncWithSystem()
+expect("syncWithSystem 接管开启并清除低电量暂停标记",
+       c.isOn && !c.pausedForLowBattery && c.shouldRestoreOnLaunch && assertionsHeld == 1 && c.cancelPauseMenuItem.isHidden)
 
 // ---------- report ----------
 teardownCurrent()
