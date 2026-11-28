@@ -39,7 +39,7 @@ func fresh(_ name: String, lid: Bool = false, sleep: Bool? = false, battery: (Bo
     Privileged.failNext = 0; Privileged.delay = 0; Privileged.adminFails = false
     Privileged.ownRuleInstalled = true; Privileged.legacyRulePresent = false
     Backlight.panel = 0.8; Backlight.failRestores = 0; Backlight.failDims = 0
-    FakeUI.responses = []; assertionsHeld = 0; failNextAssertion = 0
+    FakeUI.responses = []; FakeUI.onRespond = nil; assertionsHeld = 0; failNextAssertion = 0
     MenuBarController.restoreRetryDelay = 0.1
     if let t = threshold { SimDefaults.d.set(t, forKey: "batteryThreshold") }
     pre()
@@ -149,12 +149,13 @@ expect("自动关闭 disablesleep 并进入低电量暂停", Power.sleepState ==
 expect("保持电源监听且释放防空闲睡眠断言", c.powerWatcher.isRunning && assertionsHeld == 0)
 expect("发出「电量低（已暂停）」通知", has("NOTIFY 电量低（已暂停）"))
 expect("恢复亮度后让电脑睡眠", Backlight.panel == 0.8 && has("run /usr/bin/pmset sleepnow"))
-expect("菜单显示暂停状态与取消自动恢复入口",
+expect("菜单显示暂停状态、无障碍描述与取消自动恢复入口",
        c.statusMenuItem.title.contains("已因低电量暂停")
        && c.toggleMenuItem.title == "立即开启合盖不休眠"
        && !c.cancelPauseMenuItem.isHidden
        && c.cancelPauseMenuItem.isEnabled
-       && c.statusItem.button?.toolTip == "合盖不休眠 — 低电量暂停（充电后自动恢复）")
+       && c.statusItem.button?.toolTip == "合盖不休眠 — 低电量暂停（充电后自动恢复）"
+       && c.statusItem.button?.image?.accessibilityDescription == "合盖不休眠：低电量暂停")
 
 // 11
 c = fresh("11 接着电源时电量低", battery: (false, 10), threshold: 20)
@@ -485,7 +486,8 @@ Power.batteryState = (true, 18); c.checkBattery()
 waitFor(3) { !c.isOn && c.pausedForLowBattery }
 expect("暂停时保留未到期定时、停掉倒计时器并显示剩余时间",
        c.deadline != nil && c.countdownTimer == nil
-       && !c.detailMenuItem.isHidden && c.detailMenuItem.title.contains("原定时剩余"))
+       && !c.detailMenuItem.isHidden && c.detailMenuItem.title.contains("原定时剩余")
+       && c.detailMenuItem.title.contains("自动恢复后继续"))
 Power.batteryState = (false, 50); c.checkBattery()
 waitFor(3) { c.isOn && !c.busy }
 expect("恢复开启后继续原定时倒计时", c.isOn && c.deadline != nil && c.countdownTimer != nil)
@@ -572,6 +574,227 @@ Power.sleepState = true
 c.syncWithSystem()
 expect("syncWithSystem 接管开启并清除低电量暂停标记",
        c.isOn && !c.pausedForLowBattery && c.shouldRestoreOnLaunch && assertionsHeld == 1 && c.cancelPauseMenuItem.isHidden)
+
+// 49
+c = fresh("49 cleanupForExit 停止定时器与防抖任务，且 terminating 后 tick 不再触发关闭")
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(600); c.startCountdown()
+setLid(c, true) // 安排 pendingDim
+c.cleanupForExit(interactive: false)
+expect("退出后 countdownTimer/statusTimer/pendingDim/powerWatcher 均已停止",
+       c.countdownTimer == nil && c.statusTimer == nil && c.pendingDim == nil && !c.powerWatcher.isRunning)
+c.deadline = Date().addingTimeInterval(-10)
+resetEvents()
+c.tick()
+expect("terminating 状态下 tick() 直接忽略，不清除 deadline 也不发命令",
+       c.deadline != nil && !has("sudo pmset"))
+
+// 50
+c = fresh("50 低电量弹窗期间电源恢复（模态重入防护）", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+FakeUI.responses = [.alertFirstButtonReturn]
+FakeUI.onRespond = { _ in
+    Power.batteryState = (false, 15)
+    c.powerWatcher.fire()
+    _ = waitFor(3) { c.isOn && !c.busy }
+}
+c.turnOn(); spin(0.2)
+expect("弹窗期间自动恢复已完成 → 点击仍然开启不重复下发 disablesleep 1",
+       c.isOn && !c.busy && !c.pausedForLowBattery
+       && events().filter { $0 == "sudo pmset disablesleep 1" }.count == 1)
+// 子场景：弹窗期间自动恢复尚在执行（busy == true）
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+resetEvents()
+Privileged.delay = 0.25
+FakeUI.responses = [.alertFirstButtonReturn]
+FakeUI.onRespond = { _ in
+    Power.batteryState = (false, 15)
+    c.powerWatcher.fire() // 开始异步 restoreOnLaunch，此时 busy == true
+}
+c.turnOn()
+waitFor(3) { c.isOn && !c.busy }; spin(0.1)
+Privileged.delay = 0
+expect("弹窗期间自动恢复仍在进行（busy）→ 不重复下发 disablesleep 1 且最终开启",
+       c.isOn && !c.busy && !c.pausedForLowBattery
+       && events().filter { $0 == "sudo pmset disablesleep 1" }.count == 1)
+
+// 51
+c = fresh("51 电池恢复 +5% 迟滞 vs 插电/降阈值立即恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 20); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+Power.batteryState = (true, 21); c.powerWatcher.fire(); spin(0.2)
+Power.batteryState = (true, 24); c.powerWatcher.fire(); spin(0.2)
+expect("电池 21%~24% 未达 20%+5% 迟滞阈值 → 保持暂停", !c.isOn && c.pausedForLowBattery && Power.sleepState == false)
+// 24% 时重启也保持暂停
+c.cleanupForExit(interactive: false)
+c = relaunch("51 电池恢复 +5% 迟滞 vs 插电/降阈值立即恢复", lid: false, sleep: false, battery: (true, 24))
+spin(0.3)
+expect("暂停状态下 24% 重启仍保持暂停", !c.isOn && c.pausedForLowBattery && c.powerWatcher.isRunning)
+// 充到 25%（阈值 + 5%）→ 自动恢复
+Power.batteryState = (true, 25); c.powerWatcher.fire()
+waitFor(3) { c.isOn && !c.busy }
+expect("电池达到 25%（阈值 +5%）→ 自动恢复开启", c.isOn && Power.sleepState == true && !c.pausedForLowBattery)
+// 再次暂停在 18%，用户把阈值降到 15%（18% > 15% 但 < 15%+5%）→ 立即恢复
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+let thresh15 = NSMenuItem(); thresh15.representedObject = 15
+c.setBatteryThreshold(thresh15)
+waitFor(3) { c.isOn && !c.busy }
+expect("用户手动调低阈值（18% > 15%）→ 无须等 +5% 立即恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery)
+// 再次暂停在 15%，插电（仍为 15%）→ 立即恢复
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+Power.batteryState = (false, 15); c.powerWatcher.fire()
+waitFor(3) { c.isOn && !c.busy }
+expect("接通电源即使电量仍为 15% 也立即恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery)
+
+// 52
+c = fresh("52 暂停期间 Power.battery() == nil 按未恢复处理（fail-closed）且不影响台式机正常重启", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+Power.batteryState = nil; c.powerWatcher.fire(); spin(0.2)
+expect("暂停期间电池读数为 nil 且阈值 > 0 → 保持暂停", !c.isOn && c.pausedForLowBattery && Power.sleepState == false)
+c.cleanupForExit(interactive: false)
+c = relaunch("52 暂停期间 Power.battery() == nil 按未恢复处理（fail-closed）且不影响台式机正常重启", lid: false, sleep: false, battery: nil)
+spin(0.3)
+expect("暂停状态重启且电池读数为 nil → 保持暂停并运行电源监听", !c.isOn && c.pausedForLowBattery && c.powerWatcher.isRunning)
+// 设为不启用（阈值 0%）→ 立即恢复
+c.setBatteryThreshold(thresh0)
+waitFor(3) { c.isOn && !c.busy }
+expect("电池读数为 nil 时把阈值设为 0% → 立即恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery)
+// 台式机（battery == nil，非低电量暂停）正常重启恢复
+c = fresh("52 台式机（无电池）非手动重启正常恢复", battery: nil, threshold: 20)
+turnOnAndWait(c)
+c.cleanupForExit(interactive: false)
+c = relaunch("52 台式机（无电池）非手动重启正常恢复", lid: false, sleep: false, battery: nil)
+waitFor(3) { c.isOn && !c.busy }
+expect("台式机（battery=nil 且非低电量暂停）重启正常自动恢复", c.isOn && Power.sleepState == true && !c.pausedForLowBattery)
+
+// 53
+c = fresh("53 低电量关闭执行中接通电源或关闭保护 → 取消 sleepnow 并立即恢复", battery: (true, 50), threshold: 20)
+turnOnAndWait(c); setLid(c, true); waitFor { Backlight.panel == 0 }
+resetEvents()
+Privileged.delay = 0.25
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+spin(0.05) // 此时 turnOff(.battery) 正在 workQueue 执行 pmset disablesleep 0
+Power.batteryState = (false, 18) // 执行期间插电
+waitFor(3) { c.isOn && !c.busy && !c.pausedForLowBattery }; spin(0.1)
+Privileged.delay = 0
+expect("执行中插电：不执行 pmset sleepnow、不发低电量暂停通知并立即恢复开启",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery
+       && !has("run /usr/bin/pmset sleepnow") && !has("NOTIFY 电量低（已暂停）")
+       && Backlight.panel == 0 && !has("restore wake=true"))
+// 子场景：执行中用户关闭低电量保护（threshold -> 0）
+Power.batteryState = (true, 50); c.powerWatcher.fire()
+resetEvents()
+Privileged.delay = 0.25
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+spin(0.05)
+c.setBatteryThreshold(thresh0)
+waitFor(3) { c.isOn && !c.busy && !c.pausedForLowBattery }; spin(0.1)
+Privileged.delay = 0
+expect("执行中禁用低电量保护：不执行 pmset sleepnow 并立即恢复开启",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery && !has("run /usr/bin/pmset sleepnow"))
+
+// 54
+c = fresh("54 低电量关闭执行中遇到非手动退出（未到期保留 / 已到期清除）", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(600); c.startCountdown()
+Privileged.delay = 0.25
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+c.cleanupForExit(interactive: false)
+Privileged.delay = 0
+expect("未到期定时：非手动退出保留低电量暂停、恢复标记与定时",
+       c.pausedForLowBattery && c.shouldRestoreOnLaunch && c.deadline != nil && Power.sleepState == false)
+c = relaunch("54 低电量关闭执行中遇到非手动退出（未到期保留 / 已到期清除）", lid: false, sleep: false, battery: (false, 80))
+waitFor(3) { c.isOn && !c.busy }
+expect("重启接电后自动恢复并继续定时", c.isOn && c.countdownTimer != nil && c.deadline != nil)
+// 子场景：定时已到期
+c = fresh("54 低电量关闭执行中遇到非手动退出（已到期定时）", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(-10)
+Privileged.delay = 0.25
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+c.cleanupForExit(interactive: false)
+Privileged.delay = 0
+expect("已到期定时：非手动退出清除低电量暂停、恢复标记与定时",
+       !c.pausedForLowBattery && !c.shouldRestoreOnLaunch && c.deadline == nil && Power.sleepState == false)
+c = relaunch("54 低电量关闭执行中遇到非手动退出（已到期定时）", lid: false, sleep: false, battery: (false, 80))
+spin(0.3)
+expect("重开接电保持关闭", !c.isOn && Power.sleepState == false)
+
+// 55
+c = fresh("55 低电量恢复执行中遇到非手动退出 → 安全恢复休眠并在重启后自动开启", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+Privileged.delay = 0.25
+Power.batteryState = (false, 50); c.powerWatcher.fire()
+c.cleanupForExit(interactive: false)
+Privileged.delay = 0
+expect("恢复途中非手动退出：等待完成并安全恢复 disablesleep=0，保留恢复标记",
+       Power.sleepState == false && c.shouldRestoreOnLaunch && !c.pausedForLowBattery)
+c = relaunch("55 低电量恢复执行中遇到非手动退出 → 安全恢复休眠并在重启后自动开启", lid: false, sleep: false, battery: (false, 50))
+waitFor(3) { c.isOn && !c.busy }
+expect("重启后自动恢复开启", c.isOn && Power.sleepState == true && assertionsHeld == 1)
+
+// 56
+c = fresh("56 合盖低电量暂停后盖子仍合着时插电 → 自动恢复并重新关背光且不唤醒屏幕", battery: (true, 50), threshold: 20)
+turnOnAndWait(c); setLid(c, true); waitFor { Backlight.panel == 0 }
+Power.batteryState = (true, 19); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }; spin(0.3)
+expect("低电量暂停睡眠前已恢复亮度", Backlight.panel == 0.8 && has("run /usr/bin/pmset sleepnow"))
+resetEvents()
+Power.batteryState = (false, 19); c.powerWatcher.fire()
+waitFor(3) { c.isOn && !c.busy }
+waitFor(2) { Backlight.panel == 0 }
+expect("盖子仍合着时插电恢复：开启 disablesleep、重新关背光且不唤醒显示器",
+       c.isOn && Power.sleepState == true && Backlight.panel == 0 && !has("restore wake=true"))
+
+// 57
+c = fresh("57 定时已过期时触发低电量关闭 → 不进入低电量暂停、停止电源监听", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+c.deadline = Date().addingTimeInterval(-10)
+resetEvents()
+Power.batteryState = (true, 18); c.powerWatcher.fire()
+waitFor(3) { !c.isOn }; spin(0.2)
+expect("已过期定时触发低电量关闭：清除状态、不暂停、停电源监听且不发已暂停通知",
+       !c.isOn && Power.sleepState == false && !c.pausedForLowBattery && !c.shouldRestoreOnLaunch
+       && c.deadline == nil && !c.powerWatcher.isRunning
+       && has("NOTIFY 电量低") && !has("NOTIFY 电量低（已暂停）"))
+Power.batteryState = (false, 80); c.powerWatcher.fire(); spin(0.2)
+expect("之后插电不再自动恢复", !c.isOn && Power.sleepState == false)
+
+// 58
+c = fresh("58 低电量暂停状态下直接选定时（30 分钟）→ 开启、清除暂停并开始倒计时", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+FakeUI.responses = [.alertFirstButtonReturn]
+c.setAutoOff(timer30)
+waitFor(3) { c.isOn && !c.busy }; spin(0.1)
+let rem58 = c.deadline?.timeIntervalSinceNow ?? 0
+expect("确认低电量后开启、清除暂停并启动 30 分钟倒计时",
+       c.isOn && Power.sleepState == true && !c.pausedForLowBattery && c.countdownTimer != nil
+       && rem58 > 29 * 60 && rem58 <= 30 * 60)
+
+// 59
+c = fresh("59 Fake PowerSourceWatcher.fire() 仅在 isRunning 时触发回调", battery: (true, 50), threshold: 20)
+turnOnAndWait(c)
+Power.batteryState = (true, 15); c.powerWatcher.fire()
+waitFor(3) { !c.isOn && c.pausedForLowBattery }
+expect("暂停时 powerWatcher 在运行", c.powerWatcher.isRunning)
+c.cancelLowBatteryPause()
+expect("取消暂停后 powerWatcher 已停止", !c.powerWatcher.isRunning)
+Power.batteryState = (false, 100)
+c.powerWatcher.fire(); spin(0.2)
+expect("停止后 fire() 不触发回调、保持关闭", !c.isOn && Power.sleepState == false)
 
 // ---------- report ----------
 teardownCurrent()

@@ -117,11 +117,33 @@ final class Backlight {
     func reassertLastRestore() {}
 }
 
+final class PowerSourceWatcher {
+    var onChange: (() -> Void)?
+    private(set) var isRunning = false
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        ev("powerWatcher start")
+    }
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        ev("powerWatcher stop")
+    }
+    func fire() {
+        if isRunning { onChange?() }
+    }
+}
+
 enum FakeUI {
     static var responses: [NSApplication.ModalResponse] = []
+    static var onRespond: ((NSAlert) -> Void)?
     @discardableResult
     static func respond(_ alert: NSAlert) -> NSApplication.ModalResponse {
         ev("ALERT \(alert.messageText)")
+        let hook = onRespond
+        onRespond = nil
+        hook?(alert)
         return responses.isEmpty ? .alertSecondButtonReturn : responses.removeFirst()
     }
     static func activate(ignoringOtherApps: Bool) {}
